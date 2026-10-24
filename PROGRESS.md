@@ -123,3 +123,12 @@ scripts/ppt_content/ch{N}.py)+ 并行 5 个后台子代理:
 - 程序化审查先行:14 前沿关键词零覆盖/6 讲缺 QUIZ/22 讲缺 CODE/国标 6 类文档缺口 → 全部闭环
 - CODE 补齐教训:猜锚点 2 轮仅中 13 → 改"QUIZ 前确定性插入"一次清零(确定性优于猜测)
 - PulsarAuditBus 事件循环阻塞重构:run_in_executor 移交 I/O 线程池,测试验证 call_later 准时触发
+
+
+## v1.5 审查闭环(2026-10-24)
+
+- 五角色二审 → 三代理(code-reviewer + visual-judge×3)→ 全部修复 → 复验/终验两轮
+- 关键坑位:①threading.Lock 嵌套自锁死锁(改 RLock);②LibreOffice PDF 导出不遵守
+  wrap=none(内容侧解决:动态字号+自动分行);③静态字符串补丁被 ruff 重排后断言
+  静默失效 2 次(改行号定位重放);④幂等键被 429 消费(限流前置)
+- 工程仓 4304508 / 课程仓 b0dbfbe 双推送完成
