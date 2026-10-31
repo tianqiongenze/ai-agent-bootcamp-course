@@ -1,0 +1,18 @@
+# macOS 系统文件
+.DS_Store
+._*
+
+# 会话附件与临时目录
+.loomy-attachments/
+*.tmp
+~$*
+
+# 导出产物（可由 scripts/build_docs.py 重新生成时按需取消注释；
+# 当前策略：导出的 Word/PDF 一并入库，方便学生直接下载，故不忽略 export/）
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# Node（若后续引入前端工具）
+node_modules/
