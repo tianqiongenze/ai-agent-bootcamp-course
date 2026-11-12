@@ -5,7 +5,7 @@
 | 项 | 内容 |
 |---|---|
 | 实验类型 | 阅读理解 + 架构表达 |
-| 实验环境 | 课程仓库 `docs/07-项目资源/adr/`（ADR-001~004）、SAD.md |
+| 实验环境 | 课程仓库 `docs/07-项目资源/dap-v2工程文档/`（ADR-001~004 平铺于此目录，另有 SAD.md/RUNBOOK.md/TEST-REPORT.md/DAP-v2-PROGRESS.md/DAP-v2-README.md）、SAD.md |
 | 分组 | 结对 + 组内分工（每组认领 1 份 ADR 深读） |
 | 提交物 | 架构说明/勘误 PR + 学生讲堂①讲稿 |
 
@@ -19,7 +19,7 @@
 
 ## 二、环境与准备
 
-- 材料：`ADR-001-reuse-shared-infra.md`（复用共享基建）、`ADR-002-orchestration-engine.md`（自研编排）、`ADR-003-v2-parallel-to-v1.md`（双轨并行）、`ADR-004-capacity-honesty.md`（容量诚实）。
+- 材料（均在 `docs/07-项目资源/dap-v2工程文档/`，项目仅立 4 份 ADR）：`ADR-001-reuse-shared-infra.md`（复用共享基建）、`ADR-002-orchestration-engine.md`（自研编排）、`ADR-003-v2-parallel-to-v1.md`（双轨并行）、`ADR-004-capacity-honesty.md`（容量诚实）；延伸阅读：`SAD.md`（六层架构与 §4 关键机制——三级缓存等）、`TEST-REPORT.md`（§4 载有 Pulsar 异步＋DLQ 决策留痕）。
 - 工具：draw.io / Excalidraw / 纸笔均可，导出 PNG 入库。
 
 ## 三、实验步骤

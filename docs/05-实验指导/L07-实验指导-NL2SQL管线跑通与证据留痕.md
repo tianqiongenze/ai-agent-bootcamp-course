@@ -13,14 +13,14 @@
 
 ## 一、实验目标
 
-1. 【应用】通过控制台/网关完成 3 条问句的端到端查询并留证据。
-2. 【理解】对照五步管线日志，指出每一步的中间产物与耗时。
-3. 【应用】刻意构造 1 条会走"模板降级"的问句，记录降级路径（model 标记）。
+1. 【应用】通过控制台/网关完成 3 条问句的端到端查询并留证据（run_id 取证：`POST /v1/query` → `GET /v1/runs/{run_id}`）。
+2. 【理解】对照 run 记录的 events 步骤序列（retrieve / generate / col_check / execute），指出每一步的中间产物与耗时。
+3. 【应用】刻意构造 1 条会走"模板兜底"的问句，记录降级路径（`model=fallback-template` 标记）。
 
 ## 二、环境与准备
 
 - 访问方式：控制台 `https://console.dap-v2.local`（课程账号 course-student-XX）。
-- 认证提醒：直接调网关 REST/GraphQL 时必须带内部认证头 `x-internal-token`（tools 服务有 401 拦截）。
+- 认证提醒：控制台操作已带登录态；直接调网关 REST 时用 `POST /v1/auth/login` 换 JWT 走 `Authorization: Bearer`；工具层 `/mcp/*` 有 `x-internal-token` 401 拦截（服务间调用才用）。
 - 日志查看：教师发放只读日志检索入口（Loki/文件均可），本实验核心是**看轨迹**。
 
 ## 三、实验步骤
@@ -39,10 +39,11 @@
 
 ```
 问句：<原文>
-生成 SQL：<从控制台复制>
-返回行数：<n> 行
-耗时分布：SchemaLinking __ms / 检索 __ms / LLM __ms / 自校验 __ms / 沙箱 __ms
-model 标记：<llm / template / faq-hit>
+run_id：<run-xxxx>（取件码，凭它取全过程记录）
+生成 SQL：<result.sql 从 run 记录复制>
+返回行数：<execute 事件 rows 字段> 行
+model 标记：<qwen2.5:14b / qwen2.5-coder:7b / fallback-template / faq-hit>
+步骤序列：<retrieve hits=N → generate → col_check → execute rows=N>
 截图编号：<S-07-XX>
 ```
 

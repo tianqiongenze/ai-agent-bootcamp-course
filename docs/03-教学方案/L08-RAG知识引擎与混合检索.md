@@ -13,6 +13,19 @@
 | 企业站 PR 任务 | **PR-08**：为"售后域"建立知识索引（字段级 + 指标定义级 + 规则条目级三档 chunk，含 faq 元数据），跑 5 条验证问句 ≥4 条命中正确条目 |
 | 课后费曼任务 | 学生讲堂③正式版：讲"为什么纯向量检索会翻车"，必须带一个亲手做出来的翻车案例 |
 
+## 〇、本讲术语小白卡（先看懂再开工）
+
+| 术语 | 人话解释 | 生活化类比 |
+|---|---|---|
+| 向量 | 给每段话一个"坐标"，意思近的坐标挨得近 | 同学按兴趣坐座位：聊得来的坐一起 |
+| embedding | 算出这个坐标的过程 | 给每本书贴上位置标签 |
+| cosine 相似度 | 两个坐标方向有多一致，打 0–1 分 | 两人兴趣方向有多重合 |
+| chunk | 把长文档切块，一块一个答案粒度 | 切蛋糕：太大一口吃不下，太小尝不出味 |
+| OOV | 词典里没有的生词（如订单号 O 开头） | 字典查不到的生僻外文名 |
+| 语义缓存 | 问法不同意思相同的题，直接抄上次答案 | 抄同桌的同义题答案（意思一样才敢抄） |
+| 置信门槛 | 相似度低于这条线就不采信 | 低于 60 分的答卷不采用 |
+| RRF 融合 | 业界混合检索的多路结果融合打分法（本课拓展） | 三个评委的排名合成总分 |
+
 ## 二、任务描述（客户委托单）
 
 > **委托单编号：DAP-RAG-08**
@@ -20,8 +33,8 @@
 
 ## 三、学习目标
 
-1. 【理解】解释三层检索的命中分工与兜底关系：L1 指标/表精确命中（含同义词归一）→ L2 Milvus 向量（cosine，faq 元数据透传）→ L3 CRDB `ILIKE` 关键词兜底（宁漏勿误）。
-2. 【应用】走读 `retriever.py` / `semantic_cache.py`，画出含置信门槛与降级路径的检索决策流图。
+1. 【理解】解释三层检索的命中分工与兜底关系：L1 指标/表精确命中（CRDB `metrics` 表，含同义词归一）→ L2 Milvus 向量（cosine，faq 元数据透传）→ L3 CRDB `ILIKE` 关键词兜底（`meta_tables`/`few_shots`，宁漏勿误）；并说出它与业界 hybrid-RAG（BM25＋RRF 融合＋重排）的差距——本课实现是"三层兜底"，无词频打分与 RRF 融合。
+2. 【应用】走读 `services/tools/main.py` 的 `metadata_search` 与 `/mcp/semantic-cache/lookup`，画出含置信门槛与降级路径的检索决策流图。
 3. 【分析】用对照实验证据解释"纯向量为何翻车"的两类根因：同义词漂移（知识库"销售额"vs 问句"营业额"）与编号/OOV 类查询（向量对编号不敏感）。
 4. 【应用】完成语义缓存 0.92 阈值权衡实验：在 0.85/0.92/0.96 三档下测量命中率与错误命中率，解释 0.92 是"省 LLM 调用"与"答错题"之间的权衡点（LCO 铁律）。
 5. 【创造】为售后域设计并落地三档粒度知识索引（含元数据 owner/updated_at/faq 标记），通过 5 条问句验证并复盘 chunk 粒度得失。
@@ -30,22 +43,38 @@
 
 **教学重点**
 1. 三层互补逻辑：每层的命中域、置信门槛、失败出口——以及"为什么必须有 L3"。
+
+```flow
+问句 → ①L1 精确 → ②L2 向量 → ③L3 关键词 → 合并去重 → 按分排序 → TopK 注入
+```
+
 2. chunk 粒度策略：字段级（Schema 问答）/ 指标定义级（口径问答）/ 规则条目级（售后规则问答）各自适配的问句形态。
 
 **教学难点**
-1. 阈值权衡的本质：学生倾向认为"阈值越高越安全"。
-   **突破策略**：三档阈值实验让"命中率"与"错误命中率"两条曲线同屏——0.96 时几乎不命中（缓存白建），0.85 时把"退货率"当"退款额"答（错误命中），0.92 是本项目经验权衡点；再追问"什么业务该调高/调低"（答错代价高的调高，如口径类；闲聊类可低）。
-2. chunk 粒度过粗/过细的检索损伤（过粗→单条向量语义稀释；过细→命中碎片答非所问）。
-   **突破策略**：同一售后规则文档分别按"整段"与"规则条目"两种切法灌入，用同一问句对比 top1 命中内容，亲眼看到整段切法返回的无关半句。
+1. 向量/cosine 等抽象概念无直觉（学生第一次接触"意思的坐标"）。
+   **突破策略（三步台阶）**：
+   - 台阶1·类比直觉（前移正文）："查字典"——向量检索像"只看字长得像不像"翻字典：'营业额'和'利润'字形气质相近就容易翻错页；L1 同义词归一＝先查字典的"拼音索引/部首索引"；L3 关键词兜底＝实在不行就一页页逐字扫。chunk＝切蛋糕（太大一口吃不下，太小尝不出味道）。
+   - 台阶2·看演示：**"向量三分钟"**——黑板画二维坐标，'销售额'和'营业额'两点相邻、'销售额'和'退货率'两点远离，画完再讲三层检索；随后现场跑两条"必翻车"问句看真实翻车。
+   - 台阶3·动手复现：学生在 R2 用自己组的攻击问句复现翻车，标注"死在哪层、被哪层救回"。
+2. 阈值权衡的本质：学生倾向认为"阈值越高越安全"。
+   **突破策略（三步台阶）**：
+   - 台阶1·类比直觉：阈值＝"敢抄同桌答案的把握线"——线太低什么都敢抄（错也抄），线太高永远不敢抄（缓存白建）。
+   - 台阶2·看演示：三档阈值实验"命中率"与"错误命中率"两条曲线同屏——0.96 几乎不命中（缓存白建），0.85 把"退货率"当"退款额"答（错误命中），0.92 是项目经验权衡点。
+   - 台阶3·动手复现：追问"什么业务该调高/调低"（答错代价高的调高，如口径类；闲聊类可低），并用 R3 数据写出分档建议。
+3. chunk 粒度过粗/过细的检索损伤（过粗→单条向量语义稀释；过细→命中碎片答非所问）。
+   **突破策略（三步台阶）**：
+   - 台阶1·类比直觉：整块蛋糕没法一口吃（语义稀释）；切成渣尝不出是什么蛋糕（碎片答非所问）。
+   - 台阶2·看演示：同一售后规则文档"整段切"与"规则条目切"两种灌法，教师演示 top1 命中内容对比。
+   - 台阶3·动手复现：R4 学生自己重灌一次"整段切法"，用同一问句对比 top1 是否漂移到无关半句。
 
 ## 五、教学准备
 
 | 类别 | 内容 |
 |---|---|
-| 环境 | Milvus 可写（注意：`pymilvus` 插入主键必须 int64；`numpy>=1.26,<2.0`）；CRDB 平台库 `kb_chunks` / `kb_entities` 表就绪 |
-| 代码 | `services/insight-agent/app/rag/`：`retriever.py`、`semantic_cache.py`、`chunker.py`、`ingest.py`；`evals/sem_cache_sweep.py`；探针集 `evals/rag_probe_20.jsonl`（含 6 对"近义对"与 4 条"编号类"问句） |
+| 环境 | Milvus 可写（注意：`pymilvus` 插入主键必须 int64；`numpy>=1.26,<2.0`）；CRDB 平台库真实表：`metrics`（L1 精确命中源）/`meta_tables`/`meta_columns`/`few_shots`（L3 关键词兜底源）；Milvus collection：`dap_knowledge`/`dap_semantic_cache` |
+| 代码 | `services/tools/main.py`：`metadata_search`（三层检索真实实现）、`/mcp/semantic-cache/lookup|put`（语义缓存）、`/mcp/index/knowledge`（索引重建）；`services/worker/pipeline.py` retrieve 节点（检索消费方）；探针集 `evals/rag_probe_20.jsonl`（教师发放，含 6 对"近义对"与 4 条"编号类"问句） |
 | 资料 | 售后域素材 `docs/knowledge/aftersale_rules.md`（6 条退换货规则）+ 售后指标口径草案；L07"未解决清单"汇总（本讲靶子） |
-| 工具 | curl、jq、python CLI；决策流图模板（白板/在线绘图） |
+| 工具 | curl、jq、python（阈值扫描用对 `/mcp/semantic-cache/lookup` 返回的 distance 离线统计）；决策流图模板（白板/在线绘图） |
 | 分组 | 沿用结对；每组领取一个"翻车复现任务"（同义词组 / 编号组二选一） |
 
 ## 六、教学过程设计（六步法：资讯 30′/计划 30′/决策 20′/实施 90′/检查 40′/评价+学生讲堂 30′）
@@ -53,28 +82,35 @@
 ### 6.1 资讯（30′）
 
 **【教师活动】**
-1. 用 L07 留下的悬念开场，现场跑两条"必翻车"问句（纯向量开关打开）：
+1. **"向量三分钟"**（8′，先建直觉再讲系统）：黑板画二维坐标——'销售额'和'营业额'两点相邻、'销售额'和'退货率'两点远离；"查字典"类比前移：向量检索像"只看字长得像不像"翻字典，同义词归一＝拼音索引，关键词兜底＝逐字扫。
+2. 用 L07 留下的悬念开场，现场跑两条"必翻车"问句（强制纯向量开关）：
 
 ```bash
-python -m services.insight_agent.rag.query --q "订单号 O 开头怎么查" --vector-only
-# top1: "如何申请运费险理赔"（score 0.71）—— 编号 OOV，向量近似随机 → 翻车
-python -m services.insight_agent.rag.query --q "营业额怎么统计" --vector-only
-# top1: "利润口径说明"（score 0.78）—— 同义词漂移：营业额→利润 ≠ 销售额 → 翻车
+# 这步在干什么：只走 L2 向量层检索（禁用 L1/L3），看它翻车
+curl -s -X POST http://<tools>/mcp/metadata.search -H "x-internal-token: $TOKEN" \
+  -d '{"query": "订单号 O 开头怎么查", "top_k": 1}' | jq '.results[0]'
+# top1: "如何申请运费险理赔"—— 编号 OOV，向量近似随机 → 翻车
+curl -s -X POST http://<tools>/mcp/metadata.search -H "x-internal-token: $TOKEN" \
+  -d '{"query": "营业额怎么统计", "top_k": 1}' | jq '.results[0]'
+# top1: "利润口径说明"—— 同义词漂移：营业额→利润 ≠ 销售额 → 翻车
 ```
 
-2. 板书三层检索决策流（含门槛与出口）：
+3. 板书三层检索决策流（含门槛与出口，与 `metadata_search` 代码一一对应）：
 
 ```
 问句 q
- ├─ L1 精确命中：kb_entities（指标名/表名/别名 + 同义词归一表）
+ ├─ L1 精确命中：CRDB metrics 表（指标名/显示名 子串匹配 + 同义词归一配置）
  │    "营业额"─同义词─▶"销售额"─▶ metric:gmv ✓ 直接返回（毫秒级、零模型调用）
  ├─ L2 向量：embed(q) → Milvus dap_knowledge（cosine top-k，faq 元数据随行透传）
- │    gate: top1.score ≥ 0.75 才采信，否则下沉        ← 置信下限
- └─ L3 关键词兜底：CRDB kb_chunks WHERE text ILIKE '%订单号%' LIMIT 5
+ │    gate: top1 得分 ≥ 0.75 才采信，否则下沉        ← 置信下限（教学口径：真实代码三路合并排序后返回，0.75 用于讲解"低分不采信"的工程直觉）
+ └─ L3 关键词兜底：CRDB ILIKE（meta_tables 表名/描述/业务域 + few_shots 问答）
       （宁漏勿误：命不中就明说"知识库未覆盖"，不硬答）
+ → 三路结果合并去重（kind:id 键）→ 按分排序 → 截断 top_k 注入 prompt
 ```
 
-3. 讲解 chunk 粒度三档表（重点：粒度=检索单元=答案单元）：
+> 拓展一句（对接业界）：主流 hybrid-RAG 是 BM25 稀疏检索＋向量稠密检索两路召回、用 RRF（倒数排名融合）合成、再过 cross-encoder 重排；本课实现是"三层兜底＋合并去重排序"，没有词频打分与 RRF——L15 评测会看到它的上限在哪。
+
+4. 讲解 chunk 粒度三档表（重点：粒度=检索单元=答案单元；"切蛋糕"类比见难点）：
 
 | 粒度 | 切法 | 适配问句 | 风险 |
 |---|---|---|---|
@@ -109,7 +145,7 @@ python -m services.insight_agent.rag.query --q "营业额怎么统计" --vector-
 
 ### 6.3 决策（20′）
 
-**【教师活动】** 审核两组关键决策：① R2 攻击问句是否真有区分度（否定句"退货不收运费对吗"会被 L3 命中吗？）；② R4 粒度选择是否与问句形态匹配。宣布写入纪律：灌索引走 `ingest.py`（幂等，带 `domain` 标签），**禁止**手工 insert 向量记录（int64 主键 + 元数据 schema 易错）。
+**【教师活动】** 审核两组关键决策：① R2 攻击问句是否真有区分度（否定句"退货不收运费对吗"会被 L3 命中吗？）；② R4 粒度选择是否与问句形态匹配。宣布写入纪律：知识条目按 `labs/L08/` SQL 模板写入 CRDB（幂等，带 domain 标签），灌完统一走 `POST /mcp/index/knowledge` 重建向量索引；**禁止**手工直接 upsert Milvus 向量记录（int64 主键 + 元数据 schema 易错，真实仓库教训）。
 
 **【学生活动】** 定稿攻击问句与切分草案；确认验证问句 5 条已写死进任务单（R4 不许改）。
 
@@ -119,74 +155,85 @@ python -m services.insight_agent.rag.query --q "营业额怎么统计" --vector-
 
 ### 6.4 实施（90′）
 
-#### 子步骤 1（20′）：R1 三层检索代码走读（主材料节选）
+#### 子步骤 1（20′）：R1 三层检索代码走读（主材料节选，dap-v2 真实代码）
 
 ```python
-# services/insight-agent/app/rag/retriever.py（节选，走读版）
-def retrieve(q: str, top_k: int = 5):
-    # L1 精确命中：指标/表/别名 + 同义词归一（CRDB 表 kb_entities）
-    if hit := exact_lookup(q):                       # "营业额"→归一→"销售额"→metric:gmv
-        return [hit], layer="L1"
-    # L2 向量：dap_knowledge，faq 元数据随行透传（source/owner/updated_at/kind）
-    hits = milvus.search("dap_knowledge", embed(q), top_k,
-                         output_fields=["text", "kind", "faq_meta"])
-    if hits and hits[0].score >= 0.75:               # 置信下限：低于则不采信
-        return hits, layer="L2"
-    # L3 关键词兜底：CRDB ILIKE，宁漏勿误
-    rows = crdb.query("SELECT * FROM kb_chunks WHERE text ILIKE %s LIMIT 5",
-                      f"%{keywords(q)}%")
-    return rows, layer="L3"                          # 允许空：明说"知识库未覆盖"
-
-# semantic_cache.py（节选）
-res = milvus.search("dap_semantic_cache", embed(q), top_k=1)
-if res and res[0].score >= THRESHOLD:                # THRESHOLD=0.92
-    return cached_answer(res[0]), hit=True           # 命中即跳过整条 LLM 链（~420ms→~40ms）
+# services/tools/main.py :: metadata_search（节选，走读版，与源码一致）
+# L1 精确命中：CRDB metrics 表——指标名/显示名出现在问句中即命中（同义词在 metrics 配置归一）
+mrows = await STATE["crdb_r"].fetch(
+    "SELECT id, name, display_name, expression, description FROM metrics WHERE tenant_id=$1", ...)
+for r in mrows:
+    if r["name"] in q or r["display_name"] in q:      # "营业额"→归一配置→"销售额"
+        push("metric", r["id"], r["display_name"], ..., 1.0, {"expression": r["expression"]})
+# L2 向量：Milvus dap_knowledge，faq 元数据随行透传（source/owner/updated_at/kind）
+emb = await _embed(q)
+hits = STATE["milvus"].search("dap_knowledge", emb, f'tenant_id == "{tid}"', top_k)
+for h in hits:
+    push(h.get("kind", "table"), h.get("ref_id", ...), h.get("name", ""), h.get("text", ""),
+         1.0 - float(h.get("distance", 0.5)),         # distance 越小越相似
+         {"faq_question": h.get("faq_question", ""), "faq_sql": h.get("faq_sql", "")})
+# L3 关键词兜底：CRDB ILIKE——meta_tables（表名/描述/业务域）+ few_shots（问句/SQL），宁漏勿误
+kw = await STATE["crdb_r"].fetch(
+    "SELECT … FROM meta_tables WHERE tenant_id=$1 AND (table_name ILIKE '%'||$2||'%' OR …) LIMIT $3", ...)
+# 三路结果 push() 内按 kind:id 合并去重 → 按分排序 → 截断 top_k 返回
 ```
 
-走读三问（任务单）：① L1 为什么必须带同义词归一表？（纯精确匹配救不了"营业额"）② 0.75 与 0.92 两个门槛为什么不同值？（一个是"采信检索结果"，一个是"复用答案"——后者错代价更高）③ faq 元数据透传给谁用？（生成层引用出处 + 运营侧定位过期知识）
+```python
+# /mcp/semantic-cache/lookup（节选）——问答对的向量缓存，命中即跳过整条 LLM 链（~420ms→~40ms 量级）
+hits = STATE["milvus"].search("dap_semantic_cache", vec, …, top_k=1)
+if hits and float(hits[0].get("distance", 0)) >= S.cache_semantic_threshold:   # 阈值=0.92（config.py:70）
+    return {"hit": True, "distance": hits[0]["distance"], "doc": …}
+```
 
-#### 子步骤 2（25′）：R2 纯向量 vs 混合对照实验
+走读三问（任务单）：① L1 为什么必须带同义词归一配置？（纯精确匹配救不了"营业额"）② 0.75 与 0.92 两个门槛为什么不同值？（一个是"采信检索结果"，一个是"复用答案"——后者错代价更高）③ faq 元数据透传给谁用？（生成层引用出处 + 运营侧定位过期知识）
+
+#### 子步骤 2（25′）：R2 翻车与救援归因实验（三层分工对照）
 
 ```bash
-python -m evals.rag_compare --set evals/rag_probe_20.jsonl \
-  --mode vector-only --out out/r2_vector.json
-python -m evals.rag_compare --set evals/rag_probe_20.jsonl \
-  --mode hybrid      --out out/r2_hybrid.json
-jq '.summary' out/r2_vector.json out/r2_hybrid.json
-# 示例（以实际为准）：
-# vector-only: hit@1 = 0.55, 其中同义组 0.33 / 编号组 0.00
-# hybrid:      hit@1 = 0.90, 同义组走 L1 归一全对 / 编号组走 L3 ILIKE 0.75
+# ① 混合检索基线：对攻击问句各跑一次，从返回的 kind/score 判断命中层
+#    （kind=metric score=1.0 → L1 命中；高分 table/fewshot → L2；score≈0.5/0.45 → L3）
+curl -s -X POST http://<tools>/mcp/metadata.search -H "x-internal-token: $TOKEN" \
+  -d '{"query": "营业额怎么统计", "top_k": 3}' | jq '.results[] | {kind, name, score}'
+# ② 复现"纯向量翻车"：教师临时删除 L1 的同义词行（metrics 表"销售额/营业额"归一行）
+#    → 同一问句再跑：L1 落空 → 向量把"营业额"带到"利润"类条目（翻车复现）
+# ③ 恢复配置 → 第三次跑 → 救援成功
 ```
 
-分析任务：把 4 类失败问句分别标注"死在哪一层、被哪一层救回"，填入对照表。
+分析任务：把攻击问句逐一标注"删配置前死在哪层/被哪层救回"，填入归因表（同义词组走 L1 归一、编号组只能走 L3 逐字匹配）。
 
 #### 子步骤 3（20′）：R3 语义缓存阈值扫描
 
 ```bash
-python -m evals.sem_cache_sweep --thresholds 0.85,0.92,0.96 \
-  --set evals/rag_probe_20.jsonl --out out/r3_sweep.json
-jq -r '.[] | [.threshold, .hit_rate, .wrong_hit_rate, .llm_calls_saved] | @tsv' out/r3_sweep.json
+# 这步在干什么：对探针集每条问句调 lookup，只读地收集 cosine distance（不改服务配置）
+for q in $(jq -r '.[].q' evals/rag_probe_20.jsonl); do
+  curl -s -m 30 -X POST http://<tools>/mcp/semantic-cache/lookup -H "x-internal-token: $TOKEN" \
+    -d "{\"question\": \"$q\", \"tenant_id\": \"tenant-acme\"}" | jq -c --arg q "$q" '{q, distance, hit}'
+done > out/r3_distances.jsonl
+
+# 这步在干什么：离线分档统计——同一份 distance 数据分别按 0.85/0.92/0.96 三个阈值判命中
+python3 labs/L08/threshold_sweep.py out/r3_distances.jsonl
 # 示例（以实际为准）：
 # 0.85  hit=0.62  wrong=0.18   ← 把"退货率"当"退款额"答：错误命中不可接受
-# 0.92  hit=0.48  wrong=0.02   ← 项目经验权衡点（LCO 铁律缺省值）
+# 0.92  hit=0.48  wrong=0.02   ← 项目经验权衡点（LCO 铁律缺省值，config.py:70）
 # 0.96  hit=0.15  wrong=0.00   ← 缓存几乎白建，LLM 成本照付
 ```
 
 辩论题（任务单必答）：口径类业务（答错进财报）与闲聊类业务，分别该把阈值调向哪端？为什么？
 
-#### 子步骤 4（25′）：R4 售后域索引试灌（校内小样 10 条）
+#### 子步骤 4（25′）：R4 售后域知识条目试灌（校内小样 10 条）
 
 ```bash
-# ① 按三档粒度切分（chunker 支持字段/指标/规则三模式）：
-python -m services.insight_agent.rag.chunker \
-  --src docs/knowledge/aftersale_rules.md --granularity rule-item --out out/aftersale_chunks.jsonl
-# ② 试灌 10 条（带 domain=aftersale 与 owner/updated_at 元数据）：
-python -m services.insight_agent.rag.ingest \
-  --domain aftersale --file out/aftersale_chunks.jsonl --limit 10
-# ③ 用冻结的 5 条验证问句跑混合检索：
-python -m services.insight_agent.rag.query --q "退货上门取件收费吗" --explain
-#   layer=L2 score=0.83 text="上门取件服务费 8 元/单，买家承担…" faq_meta={owner:售后组,…}
-# ④ 粒度对照：同一问句用"整段切法"重灌一次，对比 top1 是否漂移到无关半句
+# ① 按三档粒度整理条目（字段级→meta_columns / 指标定义级→metrics / 规则条目级→few_shots 问答对）；
+#    教师发放 labs/L08/ 条目 SQL 模板（INSERT 前先在草稿区核对口径）
+# ② 试灌 10 条（CRDB 侧写入）后重建向量索引：
+kubectl -n dataagent-v2 exec deploy/dap-tools -- python /app/services/tools/init_db.py
+curl -s -X POST http://<tools>/mcp/index/knowledge -H "x-internal-token: $TOKEN" -d '{}'
+# ③ 用冻结的 5 条验证问句跑混合检索（这步在干什么：验证"切分→灌入→可命中"闭环）：
+curl -s -X POST http://<tools>/mcp/metadata.search -H "x-internal-token: $TOKEN" \
+  -d '{"query": "退货上门取件收费吗", "top_k": 1}' | jq '.results[0]'
+#   kind=fewshot text="上门取件服务费 8 元/单，买家承担…" score=0.83
+# ④ 粒度对照：同一规则改用"整段长文本"写入 meta_tables.description 再重建索引，
+#    同一问句对比 top1 是否漂移到无关半句
 ```
 
 **【教师活动】** 巡回；在 R3 主持 5 分钟全班快辩（阈值两端派各 1 组发言）；收集 R4 的粒度对照结论（过粗切法 top1 漂移案例贴看板）。
@@ -230,27 +277,24 @@ python -m services.insight_agent.rag.query --q "退货上门取件收费吗" --e
 **步骤：**
 
 ```bash
-# 1. 三档全量切分与灌入（字段级 + 指标定义级 + 规则条目级，各自带 kind 元数据）
-for g in field metric rule-item; do
-  python -m services.insight_agent.rag.chunker  --src <对应素材> --granularity $g \
-    --out out/aftersale_$g.jsonl
-  python -m services.insight_agent.rag.ingest --domain aftersale \
-    --file out/aftersale_$g.jsonl
-done
-# 2. 同义词进 L1：把"退货率/退货比例""退款额/退款金额"写入 kb_entities 别名表
-psql "$DAP_CRDB_WRITE" -c "INSERT INTO kb_entities(name, kind, aliases, domain)
-  VALUES ('退货率','metric','{退货比例,退单率}','aftersale') ON CONFLICT (name) DO NOTHING;"
-# 3. 冻结问句验证（企业导师在场见证，逐条记录 layer/score/top1 摘要）
+# 1. 三档全量条目整理（字段级→meta_columns / 指标定义级→metrics / 规则条目级→few_shots；
+#    使用教师发放的 labs/L08/ SQL 模板，各自带 kind 元数据）
+# 2. 同义词进 L1：把"退货率/退货比例""退款额/退款金额"写入 metrics 表（同义词归一配置，教师模板提供）
+# 3. 重建向量索引（CRDB 为事实源，Milvus 全量重建）：
+kubectl -n dataagent-v2 exec deploy/dap-tools -- python /app/services/tools/init_db.py
+curl -s -X POST http://<tools>/mcp/index/knowledge -H "x-internal-token: $TOKEN" -d '{}'
+# 4. 冻结问句验证（企业导师在场见证，逐条记录 kind/score/top1 摘要）：
 for q in "退货上门取件收费吗" "退货率怎么算" "一次解决率口径含不含二次工单" \
          "aftersale_ticket 表有哪些字段" "订单号 O 开头怎么查"; do
-  python -m services.insight_agent.rag.query --q "$q" --explain | tee -a out/pr08_run.log
+  curl -s -X POST http://<tools>/mcp/metadata.search -H "x-internal-token: $TOKEN" \
+    -d "{\"query\": \"$q\", \"top_k\": 1}" | tee -a out/pr08_run.log
 done
-# 4. FAQ 直答候选：把验证中表现最好的一问一答写入 faq 候选表，供 L09 人工修正回流
+# 5. FAQ 直答候选：把验证中表现最好的一问一答写入 few_shots（rating 置顶），供 L09 人工修正回流
 ```
 
-**交付物（PR 内容）：** 索引构建脚本/命令记录、`out/aftersale_*.jsonl`（chunk 产物）、`pr08_run.log`（5 问句验证记录）、FAQ 候选 1 条、"未覆盖问句清单"（明说哪些问句知识库救不了）。
+**交付物（PR 内容）：** 索引构建脚本/命令记录、`out/aftersale_*`（条目 SQL 与模板填写稿）、`pr08_run.log`（5 问句验证记录）、FAQ 候选 1 条、"未覆盖问句清单"（明说哪些问句知识库救不了）。
 
-**评审标准（企业导师三查）：** 查粒度（三档齐且 kind 元数据正确）；查验证（5 问句逐条有 layer/score 证据，≥4/5 命中）；查诚实（未覆盖项如实列出，不许用低分 L2 结果冒充命中）。
+**评审标准（企业导师三查）：** 查粒度（三档齐且 kind 元数据正确）；查验证（5 问句逐条有 kind/score 证据，≥4/5 命中）；查诚实（未覆盖项如实列出，不许用低分 L2 结果冒充命中）。
 
 | 双导师签栏 | 意见 | 签名/日期 |
 |---|---|---|
@@ -262,7 +306,7 @@ done
 | 维度 | 权重 | 90-100 分标准 | 75-89 分标准 | 60-74 分标准 | <60 分标准 |
 |---|---|---|---|---|---|
 | 决策流图（R1） | 15% | 三层+双门槛+三出口全对且标行号 | 缺一个门槛 | 缺出口 | 照抄板书 |
-| 对照实验（R2） | 25% | 双指标对照 + 失败逐条归因到层 | 有对照无归因 | 单模式跑通 | 未做 |
+| 对照实验（R2） | 25% | 基线/删配置/恢复三跑对照 + 失败逐条归因到层 | 有对照无归因 | 单次跑通 | 未做 |
 | 阈值实验（R3） | 20% | 双指标表 + 辩论结论有业务分档理由 | 缺辩论结论 | 只有数字 | 未做 |
 | 索引建设（R4/PR-08） | 25% | 三档齐 + 冻结问句 ≥4/5 + 未覆盖如实列出 | 3/5 | 2/5 且有凑题嫌疑 | <2/5 或改题 |
 | 学生讲堂（评价） | 15% | 亲手案例 + 归因 + 救援层讲清 | 案例非亲手 | 转述概念 | 讲不出 |
@@ -274,7 +318,7 @@ done
 | 项目 | 内容 |
 |---|---|
 | 讲给谁 | 同宿舍/同班不选这门课的同学（懂一点编程但不懂 NLP 即可） |
-| 讲什么 | 6 分钟讲"为什么纯向量检索会翻车"：① 带你亲手做的翻车案例（截图）；② 讲清两类根因（同义词漂移、编号 OOV）；③ 讲"哪一层救了它"（L1 同义词归一 / L3 关键词兜底）；④ 附加题：用"查字典"类比解释为什么 chunk 切太粗会答非所问 |
+| 讲什么 | 6 分钟讲"为什么纯向量检索会翻车"：① 带你亲手做的翻车案例（截图）；② 讲清两类根因（同义词漂移、编号 OOV）；③ 讲"哪一层救了它"（L1 同义词归一 / L3 关键词兜底）；④ 附加题：**自创**一个类比（课堂的"查字典"不许再用）解释为什么 chunk 切太粗会答非所问 |
 | 自评三问 | ① 我的翻车案例数据（score/layer）拿得出来吗，还是凭印象说的？② 我能不能说清 0.75 和 0.92 两个门槛为什么不相等？③ 如果老板说"把阈值调到 0.99 保证不出错"，我能用 R3 的双指标数据反驳他吗？ |
 
 ## 十、教学反思栏

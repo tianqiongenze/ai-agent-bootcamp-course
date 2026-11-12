@@ -42,8 +42,8 @@ TAG=v2-r<N+1> bash scripts/deploy.sh
 3. 在 LiteLLM 侧配置该模型（或直改 litellm 部署）；worker/tools 滚动重启
 4. 验证：提交一条 /v1/query，run.result.model 应为新模型名（非 fallback-template）
 
-## 容量扩容路径（到 100 万并发）
-1. gateway/worker HPA max 已配（10/12）；先扩副本确认 worker1 CPU 余量
+## 容量扩容路径（到 100 万注册用户 ≈ 10 万并发）
+1. gateway/worker HPA max 已配 **4/5**（以 `deploy/k8s/04-gateway.yaml`、`03-worker.yaml` 为准：gateway min3/max4、worker min3/max5）；扩容前先确认 worker1 CPU 余量，超出 max 时按下方第 2 步加节点后调大 maxReplicas（改 yaml 走 GitOps）
 2. 新增 worker 节点（K8S join 即可，GitOps 自动调度）
 3. Pulsar topic 分区扩容（jobs topic 已 6 分区，consumer Shared 自动均衡）
 4. CRDB/TiDB 已分布式，无需变更；Milvus standalone → cluster（官方扩容路径）

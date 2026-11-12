@@ -21,6 +21,7 @@
 
 - 学生机安装：kubectl（版本与集群匹配）、git；禁止在学生机保存任何集群管理员凭据。
 - 教师侧已建：课程命名空间 `dap-course-XX`（每组独立）、只读 ServiceAccount、课程分支 `course/L01-baseline`。
+- 零基础前置：开始前先过一遍"工程师生存包"微模块（终端 ls/cd/pwd 15′＋git clone/checkout/branch/commit/push/PR 35′＋HTTP 状态码与 Token 10′，见教学方案 L01 §七）——git 没用过的同学按步骤 2 的注释逐条照做即可。
 - 安全须知：全程只读；`x-internal-token` 内部认证头仅由教师发放测试值，不得写入任何文件入库。
 
 ## 三、实验步骤
@@ -28,24 +29,32 @@
 ### 步骤 1：领取账号并配置 kubectl（20′）
 
 ```bash
-# 教师发放 kubeconfig 片段后
+# 这步在干什么：确认当前终端连的是课程集群上下文
 kubectl config current-context            # 确认上下文为课程上下文
+# 这步在干什么：列出所有命名空间，找自己组的
 kubectl get ns | grep dap-course          # 应能看到本组命名空间
+# 这步在干什么：只读验证——能列出 Pod，但建不了新资源
 kubectl -n dap-course-XX get pods         # 只读验证：应能列出，但 create 被拒
+# 这步在干什么：故意尝试创建一个 Pod，验证权限确实被拦（P2-1 建议示例）
+kubectl -n dap-course-XX run test-rbac --image=nginx:alpine
+# 怎么判断对了：预期报错 Error from server (Forbidden)——这就是权限收敛生效的证据
 ```
 
-✓ 验证点：截图 A——`kubectl get pods` 成功 + 尝试创建资源被 RBAC 拒绝的报错（证明权限收敛生效）。
+✓ 验证点：截图 A——`kubectl get pods` 成功 + 上一步 `run` 被 RBAC 拒绝的 Forbidden 报错（证明权限收敛生效）。
 
 ### 步骤 2：克隆课程仓库并切分支（10′）
 
 ```bash
+# 这步在干什么：把整个课程仓库复印回家
 git clone <课程仓库URL> ai-data-platform-course
 cd ai-data-platform-course
+# 这步在干什么：翻到 L01 的基准页（起点内容）
 git checkout course/L01-baseline
+# 这步在干什么：复印一份草稿再动笔（基于基准建本组分支）
 git checkout -b course/L01-team03-zhang   # 分支命名：讲次-组号-负责人拼音
 ```
 
-✓ 验证点：`git branch --show-current` 输出符合命名规范。
+✓ 验证点：`git branch --show-current` 输出符合命名规范（怎么判断对了：输出与你刚建的名字一字不差）。
 
 ### 步骤 3：撰写《虚拟数据部成立申请表》并提首个 PR（50′）
 

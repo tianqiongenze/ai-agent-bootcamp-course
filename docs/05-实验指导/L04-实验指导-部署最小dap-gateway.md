@@ -7,7 +7,7 @@
 | 实验类型 | 综合性（部署 + 健康验证） |
 | 实验环境 | 课程命名空间 `dap-course-XX`（教师已授权受限写权限）、课程仓库 |
 | 分组 | 结对 |
-| 提交物 | 最小 gateway 部署 PR（yaml 清单）+ readyz 健康链截图 |
+| 提交物 | yaml 清单 + readyz 健康链截图 + 滚动更新回滚证据（步骤 4） |
 
 ---
 
@@ -41,9 +41,13 @@
 ```
 
 ```bash
+# 这步在干什么：把本组写的 yaml 清单一次性提交给集群（宿舍管理员开始安排床位）
 kubectl -n dap-course-XX apply -f gateway/
+# 这步在干什么：实时盯着 Pod 从拉镜像→启动→体检通过的全程（怎么判断对了：状态最终为 Running 且 READY 1/1）
 kubectl -n dap-course-XX get pods -w      # 观察启动到 Ready
+# 这步在干什么：临时打通一条本地到服务的通道（不出集群也能敲门）
 kubectl -n dap-course-XX port-forward svc/gateway 8000:8000
+# 这步在干什么：敲 readyz 门问"能接待客人吗"（怎么判断对了：返回 200；若依赖 Redis 未就绪会 503——这正是探针在干活）
 curl -s localhost:8000/readyz             # 预期 200
 ```
 
@@ -57,7 +61,25 @@ curl -s localhost:8000/readyz             # 预期 200
 
 ✓ 验证点：两次实验现象截图（前后对比）。
 
-### 步骤 4：提交 PR（10′）
+### 步骤 4：滚动更新与回滚补测（25′，校内子步骤 4 选做未完成者必做）
+
+对应教学方案 L04 校内实施子步骤 4（选做）。滚动更新＝"餐厅翻台不闭店"：新厨师先到位试菜（readiness 通过）→旧厨师才下班（preStop 排空）→客人全程有饭吃。
+
+```bash
+# 这步在干什么：后台不停敲门，验证更新全程服务不断
+watch curl -s -H "Host: gw-g0X.dap-course.local" http://10.167.2.175/api/ping
+# 这步在干什么：换一批新模板（course-v1.1）的行李箱，逐个替换
+kubectl -n dap-course-XX set image deploy/gateway gateway=<课程镜像>:course-v1.1
+# 这步在干什么：盯着换箱进度（怎么判断对了：滚动完成且循环 curl 无失败）
+kubectl -n dap-course-XX rollout status deploy/gateway
+# 这步在干什么：查看历史版本并回滚演练（时光倒流键）
+kubectl -n dap-course-XX rollout history deploy/gateway
+kubectl -n dap-course-XX rollout undo deploy/gateway
+```
+
+✓ 验证点：循环 curl 成功率（应为 100% 或仅个别超时）＋history/undo 输出截图。
+
+### 步骤 5：提交 PR（10′）
 
 - 文件：`labs/L04-gateway-minimal/`（yaml + README 说明差距清单）。
 
@@ -76,6 +98,7 @@ curl -s localhost:8000/readyz             # 预期 200
 |---|---|
 | yaml 清单 | 四件套齐全；探针依赖检查版；Secret 无明文 |
 | 截图 | Ready + readyz/healthz + 假就绪前后对比 |
+| 滚动更新证据 | 循环 curl 成功率 + rollout history/undo 输出 |
 | 差距清单 | ≥3 处，准确对应生产清单 |
 
 ## 六、诚实清单（提交前必填）

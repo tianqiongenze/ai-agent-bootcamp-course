@@ -9,9 +9,22 @@
 | 学时 | 6 学时（校内理实一体 4 学时 + 企业站实践 2 学时） |
 | 布鲁姆主层级 | **应用 / 评价**（理解渗透） |
 | 双元场地 | 校内：理实一体机房；企业站：DAP-v2 集群课程 ns `dap-course-g{N}` |
-| 前置 | L05 五件套全绿 + PR-05 灌数验证通过；通读过 `services/gateway/app/db/dual_pool.py` |
+| 前置 | L05 五件套全绿 + PR-05 灌数验证通过；通读过 `packages/dap_core/dap_core/db.py` 的 `DualPool` 类 |
 | 企业站 PR 任务 | **PR-06**：扩容演练——对 dap-gateway 施加阶梯负载，观测 HPA 3→4 扩容与 PDB 保护行为，提交含指标截图的演练报告 |
 | 课后费曼任务 | 讲清"为什么 100 万并发不能在本集群真压"，必须说出至少 2 个理由与 1 个替代方案 |
+
+## 〇、本讲术语小白卡（先看懂再开工）
+
+| 术语 | 人话解释 | 生活化类比 |
+|---|---|---|
+| 读写分离 | 点菜窗口和结账窗口分开设，结账机坏了也能点菜 | 银行存钱窗口与取号机分开排队 |
+| async/await | 点完菜不干等，先去干别的，菜好了再回来处理 | 取餐号响了再去端菜，期间刷手机 |
+| 降级 | 副窗口坏了，全部并到主窗口，慢点但不停业 | 收银台故障时全部走人工通道 |
+| 半开回切 | 副窗口修好后先试收几单，没问题再全面恢复 | 修好的电梯先空跑一趟再载客 |
+| HPA | 客流大了自动加开窗口，闲了自动关几个 | 商场按人流临时开/关收银通道 |
+| PDB | 保证任何时刻至少 N 个窗口开着才准检修 | 医院保证 ALWAYS 至少 1 个急诊室在班 |
+| RPS | 每秒接单数：系统一秒能处理多少个请求 | 奶茶店每秒能出几杯 |
+| vCPU | 厨师名额：分给这个服务的 CPU 份数 | 后厨有几个灶眼归你用 |
 
 ## 二、任务描述（客户委托单）
 
@@ -21,10 +34,11 @@
 ## 三、学习目标
 
 1. 【理解】解释读写分离的动机（读写比约 85:15）与 DAP-v2 双 DSN 拓扑：写 `cockroachdb-a:26257`、读 `cockroachdb-b:26267`，及"读库故障→读流量降级写库"的可用性权衡。
-2. 【应用】走读 `dual_pool.py`，在代码上指出路由分支、探活逻辑、降级与半开回切四处关键位置，并通过指标观测一次降级事件（DPC 降级铁律：失败必降级不阻断主链）。
-3. 【应用】完成 HPA 扩缩容实验：施压触发副本 3→4，解读 HPA 事件与稳定窗口；说明 `max=4/5` 是 42 个 ns 共享两节点的**资源收敛决策**而非能力上限。
-4. 【评价】独立推导容量外推链（100 万注册 → 10 万并发 → 5000 RPS → 副本数 → 节点数），指出每一步假设，评判 ADR-004 口径是否诚实。
-5. 【评价】评价"为什么不能在本集群真压 100 万并发"，给出压测外推的替代验证方案与证据边界（HSA）。
+2. 【应用】走读 `packages/dap_core/dap_core/db.py` 的 `DualPool`，在代码上指出路由分支（`_pick`）、探活逻辑（`_probe_loop`）、降级与恢复四处关键位置，并通过日志观测一次降级事件（DPC 降级铁律：失败必降级不阻断主链）。
+3. 【应用】完成 HPA 扩缩容实验：施压触发副本 3→4，解读 HPA 事件与稳定窗口。
+4. 【理解】说明 `max=4/5` 是 42 个 ns 共享两节点的**资源收敛决策**而非能力上限（能向他人论证"为什么不是上限"）。
+5. 【评价】独立推导容量外推链（100 万注册 → 10 万并发 → 5000 RPS → 副本数 → 节点数），指出每一步假设，评判 ADR-004 口径是否诚实。
+6. 【评价】评价"为什么不能在本集群真压 100 万并发"，给出压测外推的替代验证方案与证据边界（HSA）。
 
 ## 四、教学重点与难点
 
@@ -32,19 +46,34 @@
 1. DualPool 读写路由 + 故障降级 + 探活恢复的完整生命周期（不只是"能分流"）。
 2. 容量外推公式及其假设链：`100 万 × 10% ÷ 20s × 假设 → 5000 RPS ÷ 单副本 RPS → 副本 → 节点`。
 
+```flow
+请求进来 → ① 判读写 → ② 选连接池 → ③ 执行 SQL → ④ 返回结果
+读库故障 → 探活失败 → 降级走写库 → 探活恢复 → 回切读库
+```
+
+```flow
+负载上升 → CPU 超 70% → HPA 扩容 3→4 → 稳定窗口 → 负载回落 → 缩容回 3
+```
+
 **教学难点**
 1. 降级之后的**恢复**问题：学生容易实现"坏了就切走"，忽略"好了怎么切回来而不抖动"。
-   **突破策略**：代码走读聚焦"半开回切"（连续 3 次探活成功才回切）与指标暴露，用"闸门开合"类比 + 现场提问"为什么不是探活成功立刻回切"（答：防抖动/防半死状态打摆）。
+   **突破策略（三步台阶）**：
+   - 台阶1·类比直觉：半开回切＝"修好的电梯先空跑一趟再载客"——探活成功＝空跑一趟；真实 dap-v2 实现是"探活 SELECT 1 成功即恢复"，课堂追问"如果要求连续 3 次成功才回切，防的是什么？"（防半死状态反复打摆）。
+   - 台阶2·看演示：教师现场注入读库故障，看网关日志 `db_pool_unhealthy_rebuild` → `db_pool_recovered` 两条记录先后出现。
+   - 台阶3·动手复现：学生走读 `db.py` 的 `_pick` 与 `_probe_loop`，在自己 ns 重复注入→还原，截三态指标。
 2. 外推公式的**假设依赖**：学生第一次做容量规划，容易把线性外推当真理。
-   **突破策略**：双口径对照辩论——口径 A（实测受限 47 RPS@2C 直接除）vs 口径 B（ADR-004 生产配额 4C 约 100 RPS/副本），算出 107 vs 50 两个答案，强迫每组回答"你报给客户哪个、凭什么"；结论：**报区间 + 假设清单 + 复测计划**才诚实。
+   **突破策略（三步台阶）**：
+   - 台阶1·类比直觉：容量外推＝"筹备婚礼酒席"——请帖数（注册用户）→ 估计到场率（10%）→ 每人吃多久翻台（20s）→ 需要多少桌（RPS）→ 每桌坐几人（单副本 RPS）→ 需要几个厅（节点）。每个数字标单位，一步一步算。
+   - 台阶2·看演示：教师用"五格填空链"模板现场算一遍（每格：数字＋单位＋来源），示范第 1、2 格，学生续算。
+   - 台阶3·动手复现：双口径对照——口径 A（实测受限 47 RPS@2C 直接除）vs 口径 B（ADR-004 生产配额 4C 约 100 RPS/副本），算出 107 vs 50 两个答案（算链留在实施，辩论移入检查环节）。
 
 ## 五、教学准备
 
 | 类别 | 内容 |
 |---|---|
 | 环境 | 课程 ns 五件套全绿；`dap-gateway`（FastAPI+Strawberry GraphQL）3 副本已部署；压测机可达网关 NodePort |
-| 代码与文档 | `services/gateway/app/db/dual_pool.py`（约 120 行，走读主材料）；`deploy/k8s/base/dap-gateway-hpa.yaml`、`dap-gateway-pdb.yaml`；`docs/adr/ADR-004-capacity-honesty.md`（容量诚实口径） |
-| 工具 | `hey`（或 k6）；kubectl；`scripts/load/course-smoke.js`（课程压测脚本，限并发≤50，防打爆共享集群） |
+| 代码与文档 | `packages/dap_core/dap_core/db.py` 的 `DualPool`（约 220 行，走读主材料，重点 `_pick`/`_probe_loop` 两段）；`deploy/k8s/04-gateway.yaml`（内含 HPA 段，maxReplicas=4）、`deploy/k8s/03-worker.yaml`（HPA maxReplicas=5）、`deploy/k8s/06-pdb.yaml`（PDB minAvailable=2）；`dap-v2工程文档/ADR-004-capacity-honesty.md`（容量诚实口径） |
+| 工具 | `hey`（或 k6）；kubectl；课程轻量压测脚本（教师发放，基于 dap-v2 `tests/load/k6_gateway.js` 裁剪，限并发≤50，防打爆共享集群） |
 | 资料 | L05 验收单与 PR-05 灌数报告；M1 里程碑验收表 |
 | 分组 | 沿用 L05 结对；本讲新增角色：容量测算汇报人（每组 1 名，评价环节上台） |
 
@@ -58,8 +87,9 @@
    - 为什么分？读多写少，读库故障不应影响写（平台元数据/审计是强一致关键路径）。
    - 怎么分？DAP-v2 双 DSN：写池 `postgresql://…cockroachdb-a:26257/dap`，读池 `…cockroachdb-b:26267/dap`（CRDB 两套独立部署，读库可整体检修）。
    - 读库挂了怎么办？读流量降级到写库——牺牲读扩展性换可用性（DPC：降级不阻断），恢复后半开回切。
-3. 讲解 HPA/PDB 最小必要概念：HPA 按 CPU/自定义指标水平扩缩；PDB 保证 voluntary disruption 时至少 N 个副本存活；DAP-v2 因**两节点跑 42 个 ns**，`max=4`（gateway）/`max=5`（worker）是共享资源的收敛值。
-4. 发放 ADR-004 摘录（见实施板书），预告"你们要挑战这份 ADR 的假设"。
+3. **5′"读懂这段代码的三个前提"**（async 语法台阶，不要求会写只要求读懂主干）：① `async/await＝点完菜不干等，去干别的，菜好了再回来`（取餐号模型）；② `连接池＝一摞现成的电话线，用完还回去`（不用每次重拨号）；③ `探活 probe＝每隔 20 秒打一次电话问"还在吗"`。
+4. 讲解 HPA/PDB 最小必要概念：HPA 按 CPU/自定义指标水平扩缩；PDB 保证 voluntary disruption 时至少 N 个副本存活；DAP-v2 因**两节点跑 42 个 ns**，`max=4`（gateway）/`max=5`（worker，与 `deploy/k8s/03-worker.yaml`、`04-gateway.yaml` 一致）是共享资源的收敛值。
+5. 发放 ADR-004 摘录（见实施板书），预告"你们要挑战这份 ADR 的假设"。
 
 **【学生活动】** 记录三问答案；在草稿纸上画出"双池 + 探活 + 降级开关"草图；标出自己认为最难实现的一处。
 
@@ -73,7 +103,7 @@
 
 | 段 | 内容 | 安全约束 |
 |---|---|---|
-| A 代码走读 | 定位 dual_pool.py 四处关键位 | 只读不改 |
+| A 代码走读 | 定位 db.py DualPool 四处关键位 | 只读不改 |
 | B 故障注入 + HPA 实验 | 降级观测；施压 3→4 | 改 env 后**必须回写 overlay 并还原**；并发 ≤50、时长 ≤90s |
 | C 容量推导 | 双口径计算 + 假设清单 | 汇报 3 分钟 |
 
@@ -95,59 +125,66 @@
 
 ### 6.4 实施（90′）
 
-#### 子步骤 1（30′）：DualPool 代码走读（主材料节选）
+#### 子步骤 1（30′）：DualPool 代码走读（主材料节选，dap-v2 真实代码简化版）
 
 ```python
-# services/gateway/app/db/dual_pool.py（节选，走读版）
+# packages/dap_core/dap_core/db.py（节选，走读版）
 class DualPool:
-    """CRDB 读写分离池。写 cockroachdb-a:26257 / 读 cockroachdb-b:26267。
-    读库故障时读流量降级写库（DPC）；探活连续 3 次成功才半开回切。"""
+    """写池 + 读池，独立探活自愈。
+    写 DSN → 主库；读 DSN → follower。读库故障时读流量降级走写库（DPC）。"""
 
-    def __init__(self, write_dsn: str, read_dsn: str):
-        self._w = asyncpg.create_pool(write_dsn, min_size=2, max_size=10)
-        self._r = asyncpg.create_pool(read_dsn,  min_size=2, max_size=10)
-        self._r_healthy = True      # 降级开关
-        self._probe_ok = 0          # 连续探活成功计数（半开回切依据）
+    def __init__(self, write_dsn, read_dsn, probe_interval_s=20.0):
+        self._dsns   = {"write": write_dsn, "read": read_dsn}
+        self._pools  = {}                          # 两个独立连接池（一摞现成的电话线）
+        self._healthy = {"write": False, "read": False}   # 各自的健康开关
+        self._probe_interval = probe_interval_s    # 探活周期 20s（DPM）
 
-    async def acquire(self, *, write: bool = False):
-        if write or not self._r_healthy:   # 【位置1】路由分支：写 or 降级态→写库
-            return self._w
-        return self._r
+    def _pick(self, read: bool):                   # 【位置1】路由分支
+        role = "read" if read else "write"
+        if read and not self._healthy["read"] and self._healthy["write"]:
+            role = "write"                         # DPC：读库故障降级走写库，主链不中断
+        return role, self._pools[role]
 
-    async def probe(self):                 # 【位置2】周期 15s 探活（DPM：进程内自愈）
-        try:
-            async with self._r.acquire() as c:
-                await c.execute("SELECT 1")
-            self._probe_ok += 1
-            if not self._r_healthy and self._probe_ok >= 3:   # 【位置3】半开回切
-                self._r_healthy = True
-                METRICS.degraded.set(0)
-        except Exception:
-            self._probe_ok = 0
-            self._r_healthy = False         # 降级：读走写库，主链不中断
-            METRICS.degraded.set(1)         # 【位置4】/metrics 暴露降级态
+    async def _probe_loop(self):                   # 【位置2】周期 20s 探活（DPM：进程内自愈）
+        while True:
+            await asyncio.sleep(self._probe_interval)
+            for role, pool in self._pools.items():
+                try:
+                    async with pool.acquire() as conn:
+                        await conn.execute("SELECT 1")     # 打电话问"还在吗"
+                    if not self._healthy[role]:
+                        self._healthy[role] = True
+                        log.info("db_pool_recovered", role=role)   # 【位置3】探活成功即恢复
+                except Exception as e:
+                    self._healthy[role] = False
+                    log.warning("db_pool_unhealthy_rebuild", ...)  # 【位置4】
+                    await self._connect(role)      # 关旧池建新池（DPM 自动重建）
 ```
 
-走读四问（任务单作答）：① 读请求什么条件会去写库？② 降级是谁触发的（同步报错 or 异步探活）？③ 为什么回切要"连续 3 次"而不是 1 次？④ 运维怎么在不出 SSH 的情况下知道当前处于降级态？
+走读四问（任务单作答）：① 读请求什么条件会去写库？② 降级是谁触发的（同步报错 or 异步探活）？③ 真实实现"探活成功即恢复"，如果改成"连续 3 次成功才回切"，多防住了什么、付出了什么代价？④ 运维怎么在不出 SSH 的情况下知道当前处于降级态？
+（第③问是开放讨论：生产系统常加连续 N 次判定防"半死打摆"，代价是恢复延迟 ×N——没有免费的正确性。）
 
 #### 子步骤 2（25′）：故障注入观测（对照验证代码行为）
 
 ```bash
-# ① 基线：确认未降级
-kubectl -n $NS exec deploy/dap-gateway -- curl -s localhost:8000/metrics | grep dual_pool
-# dual_pool_degraded 0
+# ① 基线：确认未降级（这步在干什么：看网关日志里连接池健康记录）
+kubectl -n $NS logs deploy/dap-gateway --tail=50 | grep db_pool
+# db_pool_up role=read / role=write（无 unhealthy 记录）
 
-# ② 注入读故障：读 DSN 指到不存在端口（kustomize overlay 改 env，走 git！）
-cd deploy/k8s/overlays/course && $EDITOR g1-patch.yaml
-#   - op: replace path: /env/DAP_DB_READ_DSN value: postgresql://…:26267→26299
-cd ../../.. && make apply NS=$NS     # 滚动重启后读探活失败 → 降级
-kubectl -n $NS exec deploy/dap-gateway -- curl -s localhost:8000/metrics | grep dual_pool
-# dual_pool_degraded 1        ← 降级生效，读请求仍成功（走的写库）
+# ② 注入读故障：读 DSN 指到不存在端口（改 labs/L06 课程清单里的 DAP_DB_READ_DSN env，走 git！）
+$EDITOR labs/L06/read-dsn-patch.yaml
+#   把读 DSN 端口 26267 改成 26299（其余不动）
+kubectl -n $NS diff -f labs/L06/       # 先看差异（这步在干什么：预览将改哪个字段）
+kubectl -n $NS apply -f labs/L06/      # 滚动重启后读探活失败 → 降级
+kubectl -n $NS logs deploy/dap-gateway --tail=50 | grep db_pool
+# db_pool_unhealthy_rebuild role=read   ← 降级生效，读请求仍成功（走的写库）
 
 # ③ 读写功能对照：降级期间读写各发一条（证明"降级不阻断"）
 curl -s localhost:8080/api/health/full     # 读路径 200
-# ④ 还原：git revert 补丁 → make apply → 45s 内（3×15s 探活）degraded 回 0
-git revert HEAD && make apply NS=$NS
+# ④ 还原：git revert 补丁 → 重新 apply → 下一个探活周期（≤20s）内出现 db_pool_recovered
+git revert HEAD && kubectl -n $NS apply -f labs/L06/
+kubectl -n $NS logs deploy/dap-gateway -f | grep --line-buffered db_pool
+# db_pool_recovered role=read            ← 回切完成
 ```
 
 #### 子步骤 3（20′）：HPA 3→4 扩缩容实验
@@ -155,37 +192,35 @@ git revert HEAD && make apply NS=$NS
 ```bash
 kubectl -n $NS get hpa dap-gateway         # 记录当前 replicas: 3/3
 # 施压（课程脚本限 c=40，90s，只打轻端点防拖垮共享节点）：
-hey -z 90s -c 40 http://<NodePort>/api/health/full   # 或 k6 run scripts/load/course-smoke.js
+hey -z 90s -c 40 http://<NodePort>/api/health/full   # 或教师发放的课程 k6 脚本
 kubectl -n $NS get hpa dap-gateway -w      # 观察 3→4（CPU 越过 target 70%）
 kubectl -n $NS describe hpa dap-gateway | sed -n '/Events:/,$p'   # 解读扩容事件与稳定窗口
-kubectl -n $NS get pdb dap-gateway -o \
+kubectl -n $NS get pdb dap-gateway-pdb -o \
   jsonpath='{.status.currentHealthy}/{.spec.minAvailable} disruptionsAllowed={.status.disruptionsAllowed}'
 ```
 
-> 追问（任务单必答）：`max=4` 是 dap-gateway 的能力上限吗？——不是。是两节点 42 ns 共享资源下的**配额收敛**（否则一组压测全家抖动）；真正上限由 L06 容量推导在专机口径下重算。
+> 追问（任务单必答）：`max=4` 是 dap-gateway 的能力上限吗？——不是。是两节点 42 ns 共享资源下的**配额收敛**（与 `deploy/k8s/04-gateway.yaml` maxReplicas=4 一致；worker 同理 max=5），否则一组压测全家抖动；真正上限由 L06 容量推导在专机口径下重算。
 
-#### 子步骤 4（15′）：容量外推工作坊（板书推导链）
+#### 子步骤 4（15′）：容量外推算链（"五格填空链"模板，板书推导）
+
+> 发放半成品模板：第 1、2 格已填好，各组续算后三格（每格必须写"数字＋单位＋来源"）。
 
 ```
-100 万注册用户
- × 10%  高峰同时在线率（假设①：来自同类零售 App 行业值）
- = 10 万并发用户
- ÷ 20s  平均请求间隔（假设②：问答式使用，非流式）
- = 5,000 RPS 峰值目标
- ÷ 单副本吞吐：
-     口径A：47 RPS（本集群实测，2C 限流 + 共享争抢，保守下限）→ 5000/47 ≈ 107 副本
-     口径B：≈100 RPS（ADR-004：专机 4C 配额、共享争抢消除后的外推口径）→ 5000/100 = 50 副本
- × 4 vCPU/副本（口径B配额）= 200 vCPU
- ÷ 56 可分配核/64C 节点（假设③：64C 扣除系统预留）
- ≈ 3.6 → 4 台常态
- × N+1 容灾 + 滚动升级缓冲 → 4–8 台 64C 节点（ADR-004 结论）
+第1格  100 万            （注册用户，来源：销售口径）         ← 已填
+第2格  × 10%  = 10 万    （高峰同时在线率，假设①：行业值）   ← 已填
+第3格  ÷ 20s  = 5,000 ____   （平均请求间隔 20s，假设②：问答式使用 → 单位是？）
+第4格  ÷ 单副本吞吐 = ____ 副本
+       口径A：47 RPS（本集群实测，2C 限流 + 共享争抢，保守下限）→ ≈107 副本
+       口径B：≈100 RPS（ADR-004：专机 4C 配额、争抢消除后外推）→ 50 副本
+第5格  × 4 vCPU/副本 ÷ 56 可分配核/64C 节点（假设③）→ ≈3.6 → 4 台常态
+       × N+1 容灾 + 滚动升级缓冲 → 4–8 台 64C 节点（ADR-004 结论）
 ```
 
-小组任务：① 重算整条链并标注①②③假设；② 辩论"报 A 还是 B"；③ 写出**复测计划**（上线前在专机以 k6 阶梯压测复测单副本 RPS，替换假设）。
+小组任务（本环节只算不辩）：① 续算第 3–5 格并标注①②③假设与每个数字的单位；② 写出**复测计划**（上线前在专机以 k6 阶梯压测复测单副本 RPS，替换假设）。双口径"报 A 还是 B"的辩论移至 6.5 检查环节。
 
 **【教师活动】** 巡回；对子步骤 2 强调"注入走 git、还原走 revert"（DGO）；对子步骤 4 引导发现 A/B 差异根源在"实测环境≠目标环境的资源约束"，而非数学。
 
-**【学生活动】** 四问作答、指标截图、推导链与假设清单入任务单；每组形成"给客户的 3 分钟容量汇报"初稿。
+**【学生活动】** 四问作答、降级/回切日志三连截图、五格填空链与假设清单入任务单；每组形成"给客户的 3 分钟容量汇报"初稿。
 
 **【教学方法】** 代码走读 + 故障注入实验 + 工作坊辩论。
 
@@ -193,9 +228,12 @@ kubectl -n $NS get pdb dap-gateway -o \
 
 ### 6.5 检查（40′）
 
-**【教师活动】** 组织 M1 里程碑内检：每组交三件证据——① 走读四问答案（对照代码行号）；② 降级 0→1→0 的指标三连截图；③ HPA 3→4 事件截图 + 推导链。抽查反问："如果 probe 周期从 15s 改成 1s 会怎样？"（答：探活流量放大、半死读库被打爆，引出 DPM 探活频率权衡）。
+**【教师活动】** 组织 M1 里程碑内检＋双口径辩论两段：
+1. **证据核验（20′）**：每组交三件证据——① 走读四问答案（对照代码行号）；② 降级/回切日志三连截图（unhealthy → 读写正常 → recovered）；③ HPA 3→4 事件截图 + 五格填空链。抽查反问："如果 probe 周期从 20s 改成 1s 会怎样？"（答：探活流量放大、半死读库被打爆，引出 DPM 探活频率权衡）。
+2. **双口径辩论（10′）**：从实施环节"算链"自然衔接——每组 60 秒陈述"报口径 A（107 副本）还是 B（50 副本）、凭什么"，教师扮追问客户；收口结论：**报区间 + 假设清单 + 复测计划**才诚实。
+3. **M1 自评（10′）**。
 
-**【学生活动】** 互查证据链完整性（尤其"还原后 degraded=0"最常缺失）；补充完善；M1 自评打分。
+**【学生活动】** 互查证据链完整性（尤其"还原后 db_pool_recovered"最常缺失）；参与辩论并记录对方最有力的一个论据；补充完善；M1 自评打分。
 
 **【教学方法】** 证据链核验 + 追问式检查。
 
@@ -203,7 +241,7 @@ kubectl -n $NS get pdb dap-gateway -o \
 
 ### 6.6 评价 + 学生讲堂（30′）
 
-**【教师活动】** 按第八节评分；每组容量汇报人上台 3 分钟"给客户讲容量"（教师扮演质疑的销售总监，必问一句"这数字你敢签进 SLA 吗？"）；讲堂主题："为什么 100 万并发不能在本集群真压"；布置 L07 预习：跑一次 `python -m services.insight_agent.nl2sql run --q "上月销售额最高的10个品类"`。
+**【教师活动】** 按第八节评分；每组容量汇报人上台 3 分钟"给客户讲容量"（教师扮演质疑的销售总监，必问一句"这数字你敢签进 SLA 吗？"）；讲堂主题："为什么 100 万并发不能在本集群真压"；布置 L07 预习：在企业站控制台提交一条问句「上月销售额最高的10个品类」，把返回的 run_id 和最终 SQL 复制进预习卡。
 
 **【学生活动】** 汇报与应答；听众按"假设是否讲清/是否报区间/是否给复测计划"三项互评；完成费曼自评三问。
 
@@ -219,7 +257,7 @@ kubectl -n $NS get pdb dap-gateway -o \
 |---|---|
 | 任务目标 | 在课程 ns 完成一次受控扩容演练，产出可复现的 HPA/PDB 行为报告，并复核 M1 缺口 |
 | 前置条件 | L05 验收 ≥6 项；本讲校内三件证据齐 |
-| 安全约束 | 并发 ≤50、时长 ≤90s、只打 `/api/health/*`；两组一批错峰；演练后 `make diff` 必须归零 |
+| 安全约束 | 并发 ≤50、时长 ≤90s、只打 `/api/health/*`；两组一批错峰；演练后 `kubectl -n $NS diff -f labs/L06/` 必须归零 |
 
 **步骤：**
 
@@ -235,12 +273,12 @@ kubectl -n $NS describe hpa dap-gateway | sed -n '/Events:/,$p'
 # 4. PDB 影子演练（只读验证，不做真实驱逐）：
 #    记录 disruptionsAllowed 数值，并解释"若节点检修驱逐 1 个 pod，服务是否仍 3/4 可用"
 kubectl -n $NS get pdb dap-gateway -o yaml | grep -A2 -E "minAvailable|selector"
-# 5. 收尾：停止负载 → 等缩容稳定 → make diff 归零 → 还原快照对比
+# 5. 收尾：停止负载 → 等缩容稳定 → kubectl -n $NS diff -f labs/L06/ 归零 → 还原快照对比
 ```
 
 **交付物（PR 内容）：** `g{N}-hpa-report.md`（含基线/扩容事件/缩容回稳/PDB 解读四节 + 截图）、`g{N}-hpa-baseline.txt`、任务单扫描件；报告中"未验证项"栏必填（例如缩容稳定窗口未等到即下课，如实写）。
 
-**评审标准（企业导师三查）：** 查证据（事件截图与时间线一致）；查纪律（并发/时长/错峰合规，`make diff` 归零）；查解读（PDB 一节能说清 minAvailable 与 disruptionsAllowed 的含义，而非贴 yaml 了事）。
+**评审标准（企业导师三查）：** 查证据（事件截图与时间线一致）；查纪律（并发/时长/错峰合规，`kubectl diff` 归零）；查解读（PDB 一节能说清 minAvailable 与 disruptionsAllowed 的含义，而非贴 yaml 了事）。
 
 | 双导师签栏 | 意见 | 签名/日期 |
 |---|---|---|
@@ -252,7 +290,7 @@ kubectl -n $NS get pdb dap-gateway -o yaml | grep -A2 -E "minAvailable|selector"
 | 维度 | 权重 | 90-100 分标准 | 75-89 分标准 | 60-74 分标准 | <60 分标准 |
 |---|---|---|---|---|---|
 | 代码走读（实施1） | 20% | 四问全对且引用行号/位置 | 四问对 | 三问 | 靠抄 |
-| 降级实验（实施2） | 20% | 0→1→0 三态截图全 + git 方式注入/还原 | 缺回切证据 | 只见 degraded=1 | 未做或手改 live 未还原 |
+| 降级实验（实施2） | 20% | unhealthy→降级不阻断→recovered 三态日志全 + git 方式注入/还原 | 缺回切证据 | 只有故障日志无对照 | 未做或手改 live 未还原 |
 | HPA 实验（实施3） | 20% | 扩缩两方向事件齐 + 能否定"max=4=上限" | 仅扩容方向 | 截图无解读 | 未做 |
 | 容量推导（实施4） | 25% | 链条完整、假设①②③标注、报区间+复测计划 | 缺 1 个假设标注 | 只给单值结果 | 抄 ADR 结论 |
 | 客户汇报（评价） | 15% | 应答自如，主动暴露不确定度 | 被追问后能补 | 答不上 SLA 质疑 | 报单值且拍胸脯 |

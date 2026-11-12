@@ -36,13 +36,19 @@
 
 ### 步骤 2：扩容演练（40′）
 
+> 注意：HPA min=3/max=4（gateway，`deploy/k8s/04-gateway.yaml`）、min=3/max=5（worker，`03-worker.yaml`）。
+> **不要**用 `kubectl scale` 手动扩副本——HPA 会在下一个同步周期把手改的副本数改回去（这本身就是一次"漂移被 GitOps 纠正"的活教材，可顺手截图）。
+> 正确姿势：施压触发 HPA 自动扩容。压测强度控制：目标 RPS 明显低于集群**稳态实测口径 140 RPS**（k6 实测：140.3 RPS 为 70% 缓存混合负载下的稳态值，err 2.4%、p95 3.34s——不是"拐点"，拐点需阶梯压测自测）。
+
 ```bash
-kubectl -n dap-course-XX scale deploy/worker --replicas=4
-kubectl -n dap-course-XX get hpa worker -w        # 观测期望副本 vs 当前副本
-kubectl -n dap-course-XX describe pdb worker      # PDB 允许的中断数变化
+kubectl -n dap-course-XX get hpa dap-gateway -w        # 观测期望副本 vs 当前副本
+# 教师发放的轻量压测脚本（基于 dap-v2 tests/load/k6_gateway.js 裁剪，限并发≤50）：
+k6 run course-smoke.js
+kubectl -n dap-course-XX describe pdb dap-gateway-pdb   # PDB 允许的中断数变化
+kubectl -n dap-course-XX describe pdb dap-worker-pdb
 ```
 
-模拟压力（教师发放的轻量压测脚本，目标 RPS 低于集群拐点），记录：
+施压期间按下表时点记录（副本数用 `kubectl -n dap-course-XX get hpa dap-gateway`）：
 
 | 时刻 | 副本数 | CPU 利用率 | HPA 动作 |
 |---|---|---|---|

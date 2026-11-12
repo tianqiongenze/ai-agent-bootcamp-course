@@ -1,7 +1,19 @@
 # 学习情境 L10：LLM 工程：路由、降级、缓存与成本（6 学时）
 
-> 载体：DAP-v2 LLM 网关（LiteLLM）——主备模型路由（qwen2.5:14b 主 / qwen2.5-coder:7b 备 / 确定性模板兜底）＋三级缓存（L1 进程真 LRU / L2 Redis TTL 分级 / L3 Milvus 语义缓存）＋ TBP 超时预算传播＋熔断器（失败率阈值 OPEN→半开试探）＋ DPC 降级契约测试。
+> 载体：DAP-v2 LLM 工程链路——主备模型路由（qwen2.5:14b 主 / qwen2.5-coder:7b 备 / 确定性模板兜底）＋三级缓存（本讲统一称**缓存 C1 进程 LRU / C2 Redis 精确缓存 / C3 Milvus 语义缓存**，代码标签 layer=L1/L2/L3 与此一一对应）＋ TBP 超时预算传播＋熔断器（连续失败 OPEN→半开试探）＋ DPC 降级契约测试。
 > 核心命题：**任何一次 NL 查询，5 秒内必有响应；同题重复问询，不允许反复烧 GPU。**
+
+## 〇、本讲术语小白卡（先看懂再开工）
+
+| 术语 | 人话解释 | 生活化类比 |
+|---|---|---|
+| 降级矩阵 | 主力挂了替补上，替补也挂了教练亲自上（模板兜底） | 球队换人顺序表 |
+| 缓存三级 | C1 自己兜里的草稿纸 / C2 班级共享错题本 / C3 年级题库 | 兜里→班里→年级，越近越快 |
+| 熔断 | 保险丝：短路就跳闸保护全家；跳闸后先试合闸一次（半开） | 家里配电箱 |
+| TBP 预算传播 | 总共 5 秒零花钱：主力花 3.5，剩的给替补；不够就直接拿货架成品 | 零花钱分配 |
+| LRU | 缓存贴不下就淘汰"最久没人看"的那条 | 便利贴墙撕掉最旧的 |
+| 契约测试 | 消防演练：平时就得证明备用通道真能走通 | 大楼消防演习 |
+| chaos 注入 | 故意制造小故障练降级，只在课程沙箱里玩 | 消防演习拉警报 |
 
 ## 一、学习情境基本信息
 
@@ -17,42 +29,64 @@
 
 ## 二、任务描述
 
-> 【委托单 #R-2410】委托方：平台运维组。大模型接口高峰期偶发超时与宕机，一次 NL 查询等 56 秒最后还报 500，业务方体验极差；同时 GPU 预算要求压降推理成本。请给主模型配好备胎与确定性兜底，保证任何情况下接口 5 秒内必有响应；同题重复问询不得反复调用模型。——DAP-v2 SLO 改造任务单
+> 【委托单 #R-2410】委托方：平台运维组。大模型接口高峰期偶发超时与宕机，一次 NL 查询等 56 秒（v2-r12 版本口径）最后还报 500，业务方体验极差；同时 GPU 预算要求压降推理成本。请给主模型配好备胎与确定性兜底，保证任何情况下接口 5 秒内必有响应；同题重复问询不得反复调用模型。——DAP-v2 SLO 改造任务单
 
 ## 三、学习目标
 
 1. 【理解】画出"主→备→模板"三级降级矩阵与触发条件（超时 / 失败率 / 预算耗尽），说出每一级的响应语义与用户可见差异（`degraded` 标记）。
-2. 【应用】通过同题二次请求实验，用控制变量法区分 L1／L2／L3 三层命中（重启进程灭 L1、改写问法绕精确键），并以 metrics 的 `layer` 标签逐层验证。
+2. 【应用】通过同题二次请求实验，用控制变量法区分缓存 C1／C2／C3 三层命中（重启进程灭 C1、改写问法绕精确键），并以 metrics 的 `layer` 标签逐层验证。
 3. 【分析】拆解熔断器 CLOSED→OPEN→HALF_OPEN 状态机的转移条件，解释"熔断既救下游也救自己"（快速失败省预算、半开试探防误恢复）。
-4. 【分析】结合 TBP 超时预算传播，解释总预算 5s 如何在主模型 3.5s / 备模型 1.2s 之间分配，剩余预算不足时为什么直接降级而不再发起下游调用。
-5. 【评价】核算缓存命中率对推理成本的节省（L1 命中省 100% API 调用），并对照 DPC 铁律审查降级路径测试覆盖：任何没被契约测试证明的降级路径视为不存在。
+4. 【分析】结合 TBP 超时预算传播，解释总预算 5s 如何在主模型 3.5s / 备模型之间分配，剩余预算耗尽时为什么直接降级而不再发起下游调用。
+5. 【评价】核算缓存命中率对推理成本的节省（C1 命中省 100% API 调用），并对照 DPC 铁律审查降级路径测试覆盖：任何没被契约测试证明的降级路径视为不存在。
 
 ## 四、教学重点与难点
 
 **教学重点**
 
-1. 三级降级矩阵（主 qwen2.5:14b → 备 qwen2.5-coder:7b → 确定性模板）与三级缓存命中链（L1 进程 LRU → L2 Redis → L3 Milvus 语义）的结构与验证方法。
+1. 三级降级矩阵（主 qwen2.5:14b → 备 qwen2.5-coder:7b → 确定性模板）与三级缓存命中链（缓存 C1 进程 LRU → C2 Redis 精确 → C3 Milvus 语义）的结构与验证方法。
 2. 熔断器状态机与 DPC 契约测试：降级路径必须被测试证明"被触发且行为正确"。
+
+**先消歧再开课（全课程级，资讯阶段发放对照卡并钉墙）**——课程里有三套"层"编号，长得像但完全是三回事：
+
+| 体系 | 层级 | 讲次 | 一句话 |
+|---|---|---|---|
+| 检索三层 | 检索 L1 精确 / L2 向量 / L3 关键词兜底 | L08 | "怎么找到知识" |
+| 缓存三级（本讲） | 缓存 C1 进程 / C2 Redis / C3 Milvus 语义 | L10 | "怎么不重复算"（代码标签 layer=L1/L2/L3 与 C1/C2/C3 一一对应） |
+| 护栏四层 | 护栏 G1–G4：语法/资源/权限/审批 | L14 | "怎么拦住坏 SQL" |
+
+**请求→缓存→降级主链路（课堂板书/PPT 用）**
+
+```flow
+请求 → ①缓存C1→C2→C3 → ②主模型3.5s → ③备模型用剩余预算 → ④模板兜底 → 5秒内响应
+```
+
+（一句话类比，随板书讲：降级路径＝大楼的**消防通道**——平时看不见它发挥作用，但每一次消防演练（契约测试）都是在证明"火灾那天它真能走通"；从没演练过的备用出口，等于不存在。）
 
 **教学难点（附突破策略）**
 
-1. **区分"命中层"**：L1/L2/L3 命中的实验现象相近（都是"变快"），学生容易混淆。
-   - 突破策略：控制变量实验设计——①同进程同题两次＝L1；②`rollout restart` 灭进程缓存后同题＝L2；③换同义问法绕过精确键＝L3；每步都看 `llm_cache_hits_total{layer=...}` 是否 +1，用指标标签而非体感下结论。
+1. **区分"命中层"**：C1/C2/C3 命中的实验现象相近（都是"变快"），学生容易混淆。
+   - 三步台阶：台阶1（生活类比建立直觉）——三级缓存＝"草稿纸（C1 自己兜里）→ 班级共享错题本（C2）→ 年级题库（C3）"，兜里翻书最快、年级题库最慢但最全；台阶2（看一次真实演示）——教师投屏三次请求的 `dap_cache_hits_total{layer}` 指标变化，让学生看见"+1 发生在不同标签上"；台阶3（学生动手复现）——控制变量三连实验：①同进程同题两次＝C1；②`rollout restart` 灭进程缓存后同题＝C2；③换同义问法绕过精确键＝C3；每步都看 `dap_cache_hits_total{layer=...}` 是否 +1，用指标标签而非体感下结论。
 2. **半开（HALF_OPEN）试探的语义**：为什么冷却后只放行 1 个请求、试探失败为什么要立刻回 OPEN。
-   - 突破策略：状态机图＋"棋盘推演表"——学生在任务单上按请求序号逐行推演（请求 i 结果 / 状态 / 去向），把抽象状态机变成可手算的时序表；教师现场注入故障对照推演结果。
+   - 三步台阶：台阶1（生活类比）——熔断＝保险丝：短路就跳闸防烧全家；跳闸后不能一直断电，也不能立刻全合上——先"试合一次"（半开放行 1 个试探请求），还跳闸就再等一个冷却周期；台阶2（看一次真实演示）——教师现场注入连续失败，投屏 `circuit_opened` 日志与 CIRCUIT_STATE 指标；台阶3（学生动手复现）——状态机图＋"棋盘推演表"——学生在任务单上按请求序号逐行推演（请求 i 结果 / 状态 / 去向），把抽象状态机变成可手算的时序表；教师现场注入故障对照推演结果。
+
+**熔断状态机链（板书/PPT 用，参数为 dap_core/resilience.py 真实默认值）**
+
+```flow
+CLOSED → ①连续失败5次 → OPEN → ②冷却30s → HALF_OPEN → ③试探成功 → CLOSED
+```
 
 ## 五、教学准备
 
 **环境**（讲师课前 1 天核验）
 
-- `dap` 命名空间 llm-gateway / redis / milvus / ollama（主备模型）Ready；课程故障注入开关可用：`POST /admin/chaos`（仅课程环境开放，target=primary/fallback/all，mode=timeout/error）。
-- Prometheus 可查：`llm_cache_hits_total{layer}`、`llm_cache_misses_total`、`circuit_breaker_state`、`route_chain_total`。
+- `dataagent-v2` 命名空间 dap-gateway / dap-worker / dap-tools / dap-redis / ollama（主备模型）Ready；课程故障注入开关可用：`POST /admin/chaos`（**课程环境教师侧专用开关**，仓库本体无此端点；企业站替代手段＝把主模型端点置为无效地址。target=primary/fallback/all，mode=timeout/error）。
+- Prometheus 可查：`dap_cache_hits_total{layer}`（layer=L1/L2/L3，即缓存 C1/C2/C3）、`dap_cache_misses_total`、`circuit_breaker_state`（CIRCUIT_STATE）、`route_chain_total`。
 - 课程分支 `edu/2026-spring`；analyst Token 同 L09。
 
 **资料**
 
-- 代码：`dap-v2/services/llm-gateway/config.yaml`（路由/预算/熔断配置）、`router.py`（主备路由＋TBP 预算切分）、`cache.py`（三级缓存，L1 为 OrderedDict 真 LRU）、`breaker.py`（熔断器）。
-- 测试：`dap-v2/tests/llm/test_degradation_contract.py`（DPC 契约测试）。
+- 代码：`dap-v2/packages/dap_core/dap_core/llm.py`（LLMClient 主备路由，主失败自动切备）、`packages/dap_core/dap_core/resilience.py`（熔断器 CircuitBreaker＋TBP 超时预算传播 remaining_budget）、`packages/dap_core/dap_core/cache.py`（TieredCache 三级缓存，C1 为 OrderedDict 真 LRU）、`services/worker/fallback_sql.py`（DPC 确定性模板兜底，结果标注 model=fallback-template）。
+- 测试：当前仓库**尚无 LLM 降级契约测试**（tests/ 下无对应目录）——这正是企业站 PR 任务要补的真实空白（补一条 DPC 契约测试）。
 - 文档：SAD 第 6 章"LLM 网关"、RUNBOOK"模型故障处置"。
 
 **分组**：4 人一组，角色轮换：操作员 / 指标记录员 / 日志观察员 / 推演员（专责状态机表格）。
@@ -62,28 +96,29 @@
 ### 第 1 步：资讯（30 分钟）
 
 【教师活动】
-- 复盘 L09 遗留问题："FAQ 命中是幸运情况，没命中时怎么办？模型挂了呢？"现场注入 `primary=error`，一次请求演示完整降级链。
+- 前置 5′ 发放"三套编号消歧卡"（见重点部分对照表）钉墙，明确本讲只谈**缓存 C1/C2/C3**；再 5′ 用保险丝三格漫画讲状态机三态（合闸 CLOSED / 跳闸 OPEN / 试合 HALF_OPEN）。
+- 复盘 L09 遗留问题："FAQ 命中是幸运情况，没命中时怎么办？模型挂了呢？"现场注入 `primary=error`，一次请求演示完整降级链。用消防通道类比点题："今天给系统修消防通道——降级路径。"
 - 板书两张图：
 
 ```
-① 三级缓存命中链
-请求 ─► L1 进程LRU(512) ─miss─► L2 Redis(TTL分级) ─miss─► L3 Milvus语义(cosine≥0.92) ─miss─► 模型路由
-         │命中(<10ms)              │命中(<50ms)             │命中(重排后返回)                  ├─ 主 qwen2.5:14b   预算3.5s
-         ▼                         ▼                        ▼                                 ├─ 备 qwen2.5-coder:7b 用剩余预算
-       返回                       返回                     返回                               └─ 模板兜底(不调模型,<100ms,degraded=true)
+① 三级缓存命中链（代码标签 layer=L1/L2/L3 ↔ 课件称呼 C1/C2/C3）
+请求 ─► C1 进程LRU(8192) ─miss─► C2 Redis精确(TTL：查询5min/字典1h) ─miss─► C3 Milvus语义(cosine≥0.92) ─miss─► 模型路由
+         │命中(<10ms)              │命中(<50ms)                 │命中(重排后返回)                        ├─ 主 qwen2.5:14b   预算3.5s
+         ▼                         ▼                            ▼                                       ├─ 备 qwen2.5-coder:7b 用剩余预算
+       返回                       返回                          返回                                    └─ 模板兜底(不调模型,<100ms,degraded=true)
 
-② 熔断器状态机（breaker.py）
-[CLOSED] ──窗口20内失败率≥50%──► [OPEN] ──冷却60s──► [HALF_OPEN] ──试探成功──► [CLOSED]
-   ▲                                ▲                       │                      │
-   └────────────────────────────────┴──────试探失败─────────┘（回 OPEN 重新冷却）  │
-   （OPEN 态不再打主模型，直接走备/模板）◄─────────────────────────────────────────┘
+② 熔断器状态机（resilience.py CircuitBreaker，真实默认参数）
+[CLOSED] ──连续失败≥5次──► [OPEN] ──冷却30s──► [HALF_OPEN] ──试探成功──► [CLOSED]
+   ▲                          ▲                     │                     │
+   └──────────────────────────┴─────试探失败────────┘（回 OPEN 重新冷却）   │
+   （OPEN 态不再打主模型，直接走备/模板）◄──────────────────────────────────┘
 ```
 
-- 发放引导文：委托单 #R-2410 ＋ `config.yaml` 全文 ＋ 实验记录表（命中层/指标标签/耗时三列）。
+- 发放引导文：委托单 #R-2410 ＋ `config.py` 缓存/模型相关段 ＋ 实验记录表（命中层/指标标签/耗时三列）。
 
 【学生活动】
-- 通读 `config.yaml`：找出主/备/模板三级、总预算与各级预算、熔断三参数（failure_rate=0.5 / window=20 / 冷却 60s）。
-- 回答引导文 3 问：①为什么备模型要"用剩余预算"而不是自己的独立超时？②模板兜底为什么必须打 `degraded=true` 标记？③L2 的 TTL 为什么要分级（对话 1h / 代码 24h / 知识 7d）？
+- 通读 `config.py` 与 `resilience.py`：找出主/备/模板三级、总预算与各级预算、熔断三参数（failure_threshold=5 / 冷却 open_s=30s / 半开放行 1 个试探）。
+- 回答引导文 3 问：①为什么备模型要"用剩余预算"而不是自己的独立超时？②模板兜底为什么必须打 `degraded=true` 标记？③C2 的 TTL 为什么要分两级（查询结果 5min / 字典 1h）？
 
 【教学方法】演示法＋引导文法。
 
@@ -98,9 +133,9 @@
 | 实验 | 操作 | 预期指标变化 | 预期耗时 |
 |---|---|---|---|
 | 降级链 | chaos primary=timeout | route_chain 主→备 | 备路径 <5s |
-| 三级缓存 | 同题×2 / restart 后同题 / 同义改写 | hits{L1}/hits{L2}/hits{L3} 各 +1 | 10ms/50ms/300ms 级 |
-| 熔断状态机 | 连续注入 10 次失败 | breaker OPEN→HALF_OPEN | 状态转移日志 |
-| DPC＋成本 | 跑契约测试＋算账 | pytest 全绿 | — |
+| 三级缓存 | 同题×2 / restart 后同题 / 同义改写 | hits{C1}/hits{C2}/hits{C3} 各 +1 | 10ms/50ms/300ms 级 |
+| 熔断状态机 | 连续注入 5 次失败 | breaker OPEN→HALF_OPEN | 状态转移日志 |
+| DPC＋成本 | 教师演示契约测试＋课后算账 | 演示全绿 | — |
 
 【教学方法】小组计划法＋实验设计模板。
 
@@ -108,7 +143,7 @@
 
 ### 第 3 步：决策（20 分钟）
 
-【教师活动】逐组答辩，拷问两点：①你的实验怎么排除"L2 命中被误认为 L1 命中"？（看指标标签，不看体感。）②熔断推演表里，第 11 个请求（OPEN 态）会打到主模型吗？为什么这反而是优点？
+【教师活动】逐组答辩，拷问两点：①你的实验怎么排除"C2 命中被误认为 C1 命中"？（看指标标签，不看体感。）②熔断推演表里，第 6 个请求（OPEN 态）会打到主模型吗？为什么这反而是优点？
 
 【学生活动】陈述→质询→修订计划表并签字。
 
@@ -126,100 +161,101 @@
 #### 4.1 降级矩阵：注入故障观察主→备→模板（20′）
 
 ```bash
-make gateway-forward && GW=http://localhost:8000
+# 这步在干什么：把集群里的 dap-gateway 端口转发到本机
+kubectl -n dataagent-v2 port-forward svc/dap-gateway 8000:8000 && GW=http://localhost:8000
 
-# ① 注入主模型超时
+# ① 注入主模型超时（chaos 开关为课程环境教师侧开关，用完必关）
 curl -s -X POST "$GW/admin/chaos" -d '{"target":"primary","mode":"timeout"}'
-time curl -s "$GW/api/query" -H "Authorization: Bearer $ANALYST_TOKEN" \
+time curl -s -X POST "$GW/v1/query" -H "Authorization: Bearer $ANALYST_TOKEN" \
   -H 'Content-Type: application/json' -d '{"question":"按省份统计上月销量"}'
 # 预期：总耗时 <5s；日志显示主 3.5s 预算烧完 → 切备 → 备成功
-kubectl -n dap logs deploy/llm-gateway --tail=30 | grep route_chain
-# route_chain: primary(qwen2.5:14b)=timeout(3500ms) -> fallback(qwen2.5-coder:7b)=ok(9xx ms)
+kubectl -n dataagent-v2 logs deploy/dap-worker --tail=30 | grep -i "fallback\|route"
+# 预期日志（示意）：primary(qwen2.5:14b)=timeout(3500ms) -> fallback(qwen2.5-coder:7b)=ok
 
 # ② 双模型全灭 → 确定性模板兜底
 curl -s -X POST "$GW/admin/chaos" -d '{"target":"all","mode":"error"}'
-time curl -s "$GW/api/query" ... -d '{"question":"按省份统计上月销量"}'
+time curl -s -X POST "$GW/v1/query" ... -d '{"question":"按省份统计上月销量"}'
 # 预期：<100ms 返回；"degraded": true；"data" 结构与正常响应完全同构（sql/rows/columns）
 curl -s -X POST "$GW/admin/chaos" -d '{"target":"none"}'   # 用完必关！
 ```
 
-读 `router.py` 关键段（TBP）：`剩余预算 = deadline - now`；`剩余预算 < 800ms` 时不再发起下一跳，直接落模板——"下游已无预算就别浪费工作"。
+读 `resilience.py` 关键段（TBP）：每跳超时＝`min(剩余预算, 本跳上限)`（`remaining_budget`）；剩余预算耗尽直接抛 `TimeoutError` 不再外呼，请求落模板——"下游已无预算就别浪费工作"。
 
 #### 4.2 三级缓存命中实验：控制变量三连（30′）
 
 ```bash
 Q='按品类统计上个月的GMV'
-# ① 同进程同题两次：第 2 次 L1 命中
-curl -s "$GW/api/query" ... -d "{\"question\":\"$Q\"}" > /dev/null   # miss → 模型
-time curl -s "$GW/api/query" ... -d "{\"question\":\"$Q\"}"          # <10ms，L1 命中
+# ① 同进程同题两次：第 2 次 C1 命中（这步在干什么：验证进程内缓存）
+curl -s -X POST "$GW/v1/query" ... -d "{\"question\":\"$Q\"}" > /dev/null   # miss → 模型
+time curl -s -X POST "$GW/v1/query" ... -d "{\"question\":\"$Q\"}"          # <10ms，C1 命中
 curl -s "http://localhost:9090/api/v1/query" --data-urlencode \
-  'query=llm_cache_hits_total{layer="L1"}'                           # +1
+  'query=dap_cache_hits_total{layer="L1"}'                           # +1（layer=L1 即缓存 C1）
 
-# ② 重启网关灭 L1，同题再问：L2 命中（向教师报备后执行）
-kubectl -n dap rollout restart deploy/llm-gateway && sleep 30
-time curl -s "$GW/api/query" ... -d "{\"question\":\"$Q\"}"          # <50ms，L2 命中
-#   L2 键样例（课程只读账号）：
-redis-cli -h <redis-host> --scan --pattern "llm:resp:*" | head -3
+# ② 重启网关灭 C1，同题再问：C2 命中（向教师报备后执行）
+kubectl -n dataagent-v2 rollout restart deploy/dap-gateway && sleep 30
+time curl -s -X POST "$GW/v1/query" ... -d "{\"question\":\"$Q\"}"          # <50ms，C2 命中
+#   C2 键样例（课程只读账号，教师演示）：
+redis-cli -h <redis-host> --scan --pattern "dap:cache:*" | head -3
 
-# ③ 同义改写绕过精确键：L3 语义命中
-time curl -s "$GW/api/query" ... -d '{"question":"上个月每个类目的成交额汇总"}'
-kubectl -n dap logs deploy/llm-gateway --tail=50 | grep -E "cache.*L3.*score=0\.9[2-9]"
+# ③ 同义改写绕过精确键：C3 语义命中
+time curl -s -X POST "$GW/v1/query" ... -d '{"question":"上个月每个类目的成交额汇总"}'
+kubectl -n dataagent-v2 logs deploy/dap-worker --tail=50 | grep -iE "semantic.*0\.9[2-9]"
 ```
 
-L1 真 LRU 代码导读（`cache.py`， OrderedDict 实现，命中即 `move_to_end`、淘汰 `popitem(last=False)`）：
+C1 真 LRU 代码导读（`cache.py` 的 `L1Cache`，OrderedDict 实现，命中即 `move_to_end`、淘汰 `popitem(last=False)`）——类比先行：便利贴墙贴不下就撕掉最久没人看的那张：
 
 ```python
-class L1LRU:
-    def __init__(self, cap: int = 512):
-        self._d, self.cap = collections.OrderedDict(), cap
-    def get(self, k):
-        if k not in self._d:
+class L1Cache:
+    """进程内真 LRU（OrderedDict）+ TTL。零依赖，读取 ~200ns。"""
+    def get(self, key: str, now: float) -> Any | None:
+        hit = self._store.get(key)
+        if not hit:
             return None
-        self._d.move_to_end(k)            # 真 LRU：命中即摘到队尾
-        return self._d[k]
-    def put(self, k, v):
-        if k in self._d:
-            self._d.move_to_end(k)
-        self._d[k] = v
-        if len(self._d) > self.cap:
-            self._d.popitem(last=False)   # 淘汰最久未用（队头）
+        expire_at, val = hit
+        if expire_at < now:
+            self._store.pop(key, None)
+            return None
+        self._store.move_to_end(key)  # 真 LRU 触碰：命中即摘到队尾
+        return val
+
+    def put(self, key: str, val: Any, ttl_s: float, now: float) -> None:
+        if key in self._store:
+            self._store.move_to_end(key)
+        self._store[key] = (now + ttl_s, val)
+        while len(self._store) > self._maxsize:
+            self._store.popitem(last=False)   # 淘汰最久未用（队头）
 ```
 
 任务单思考题：若把 `move_to_end` 删掉会变成什么策略？（FIFO——最常被误当成 LRU 的假 LRU。）
 
-#### 4.3 熔断器状态机：注入失败推演转移（20′）
+#### 4.3 熔断器状态机：注入失败推演转移（35′，含 15′ 弹性缓冲吸收 chaos 排队等待）
 
 ```bash
-# 窗口 20 内连续 10 次失败 → 失败率 50% 触发 OPEN
-for i in $(seq 1 10); do
-  curl -s "$GW/api/query" -H "Authorization: Bearer $ANALYST_TOKEN" \
+# 连续 5 次失败（failure_threshold=5）→ 触发 OPEN（这步在干什么：人为把保险丝烧断）
+for i in $(seq 1 5); do
+  curl -s -X POST "$GW/v1/query" -H "Authorization: Bearer $ANALYST_TOKEN" \
     -H 'Content-Type: application/json' -d "{\"question\":\"熔断推演第${i}次\"}" > /dev/null
 done
-kubectl -n dap logs deploy/llm-gateway --tail=100 | grep breaker
-# breaker: CLOSED -> OPEN (fail_rate=0.55, window=20)
+kubectl -n dataagent-v2 logs deploy/dap-worker --tail=100 | grep -i breaker
+# 预期日志：circuit_opened
 curl -s "http://localhost:9090/api/v1/query" --data-urlencode 'query=circuit_breaker_state'
 ```
 
 推演员填"棋盘推演表"（请求序号 / 该请求结果 / 触发前状态 / 转移后状态 / 是否打到主模型）：
-- 第 1–10 个失败请求：CLOSED，仍打主模型；
-- 第 11 个起：OPEN，**不再打主模型**，直接走备（省掉 3.5s 等待）；
-- 60s 冷却后：HALF_OPEN，放行 1 个试探请求——成功→CLOSED，失败→回 OPEN 重新冷却。
-现场对照：关闭 chaos 后等 60s 再发 1 个请求，观察 `HALF_OPEN -> CLOSED` 日志。
+- 第 1–5 个失败请求：CLOSED，仍打主模型；
+- 第 6 个起：OPEN，**不再打主模型**，直接走备（省掉 3.5s 等待）；
+- 30s 冷却后：HALF_OPEN，放行 1 个试探请求——成功→CLOSED，失败→回 OPEN 重新冷却。
 
-#### 4.4 DPC 契约测试与成本核算（20′）
+弹性缓冲使用规则（15′）：chaos 注入按组号分时、等待排队时先做推演表互查；缓冲剩余时间用于 HALF_OPEN 现场对照——关闭 chaos 后等 30s 再发 1 个请求，观察 `HALF_OPEN -> CLOSED` 日志；仍有多余时间则加练"试探失败回 OPEN"分支。
 
-```bash
-cd dap-v2 && pytest tests/llm/test_degradation_contract.py -v
-# 用例（节选）：
-#   test_primary_down_fallback_ok      主挂→备接住，200 且非 degraded
-#   test_both_down_template_ok         双挂→模板，200 且 degraded=true
-#   test_template_output_schema_stable 模板响应结构与正常响应同构（前端无感）
-#   test_faq_hit_skips_llm_entirely    FAQ 命中完全不进模型路由
-```
+#### 4.4 DPC 契约测试讲解与成本布置（5′，成本核算改为课后作业）
 
-契约测试关键断言（为什么"必须显式降级标记＋同构 schema"）：
+教师投屏讲解（不占学生操作时间）：
+
+- DPC 铁律："没被契约测试证明的降级路径等于不存在。"仓库当前**尚无** LLM 降级契约测试——企业站任务就是补上它。契约测试必须断言的三件事（板书）：①触发条件真实发生；②降级响应语义显式（`degraded=true` 不得冒充正常）；③模板响应结构与正常响应同构（`sql/rows/columns`，前端不崩）。
 
 ```python
+# 企业站补测示例骨架（tests/ 下新建，断言口径如下）：
 def test_both_down_template_ok(chaos_all):
     r = client.query("上月GMV")
     assert r.status_code == 200
@@ -227,19 +263,19 @@ def test_both_down_template_ok(chaos_all):
     assert set(r.json()["data"].keys()) == {"sql", "rows", "columns"}  # 前端不崩
 ```
 
-成本核算（任务单表格）：班级 30 人 × 20 问/天 × 30 天＝18000 问；命中率 60% 时省 10800 次推理；按单次 LLM 路径 56s 折算 GPU 时＝10800×56/3600≈168 GPU·小时/月。结论一句话：**L1 命中省 100% API 调用——缓存是最高级的降级。**
+- 成本核算改为**课后作业**（任务单留表格）：班级 30 人 × 20 问/天 × 30 天＝18000 问；命中率 60% 时省 10800 次推理；按单次 LLM 路径 56s（v2-r12 版本口径）折算 GPU 时＝10800×56/3600≈168 GPU·小时/月。课堂只给结论一句话：**C1 命中省 100% API 调用——缓存是最高级的降级。**
 
 ### 第 5 步：检查（40 分钟）
 
-【教师活动】发布检查清单，重点核验"指标证据链"：每组必须能回答"你怎么知道是 L2 命中而不是 L1？"
+【教师活动】发布检查清单，重点核验"指标证据链"：每组必须能回答"你怎么知道是 C2 命中而不是 C1？"
 
 【学生活动】自查＋互查：
 1. 降级链日志两条（主→备 / 双挂→模板）＋对应耗时；
-2. 三级缓存各一条 `hits_total{layer}` +1 证据＋耗时对比；
-3. 熔断推演表 15 行以上且状态转移与日志一致；
+2. 三级缓存各一条 `dap_cache_hits_total{layer}` +1 证据＋耗时对比；
+3. 熔断推演表覆盖 CLOSED→OPEN→HALF_OPEN 三次转移且与日志一致；
 4. HALF_OPEN 试探的日志原文；
-5. pytest 输出全绿截图；
-6. 成本核算表数字自洽；
+5. 企业站契约测试任务已认领（含断言三件事清单）；
+6. 成本核算课后作业表格已领取（课堂核对结论一句话）；
 7. chaos 开关确认已全部关闭（`{"target":"none"}` 返回 200）——**环境复原是硬性检查项**。
 
 【教学方法】核对表法＋同伴互评。
@@ -259,10 +295,10 @@ def test_both_down_template_ok(chaos_all):
 |---|---|
 | 任务目标 | 认领一条降级路径，完成"故障注入→现象采集→契约测试补齐"的完整闭环 PR |
 | 场地/协作 | 企业实训站；2 人结对；企业导师按"测试是否真在 CI 跑"把关 |
-| 认领清单（每组一条） | ① 主超时→备 ② 备超时→模板 ③ L1 miss→L2 ④ L2 miss→L3 ⑤ 熔断 OPEN 直走备 ⑥ FAQ 命中跳过模型 |
-| 步骤 | ① 通读该路径代码与现有测试，找出未覆盖分支 → ② 设计注入方案（chaos 开关/重启/改写问法）→ ③ 执行并采集日志＋metrics 证据 → ④ 在 `tests/llm/test_degradation_contract.py` 补一条契约测试（断言触发条件＋响应语义）→ ⑤ 本地与 CI 双跑绿 → ⑥ 提 PR |
+| 认领清单（每组一条） | ① 主超时→备 ② 备超时→模板 ③ C1 miss→C2 ④ C2 miss→C3 ⑤ 熔断 OPEN 直走备 ⑥ FAQ 命中跳过模型 |
+| 步骤 | ① 通读该路径代码（`llm.py` / `resilience.py` / `cache.py` / `fallback_sql.py`）与现有测试，找出未覆盖分支 → ② 设计注入方案（chaos 开关/重启/改写问法）→ ③ 执行并采集日志＋metrics 证据 → ④ 新建 DPC 契约测试（断言触发条件＋响应语义）→ ⑤ 本地与 CI 双跑绿 → ⑥ 提 PR |
 | 交付物 | PR 含：新增测试代码＋故障注入复现步骤（写入 PR 描述）＋证据日志/metrics 截图 |
-| 评审标准 | ① 测试在 CI 实际执行（附 CI 链接，防"配而未接"）② 断言含降级语义（degraded 标记 / schema 同构 / 不打主模型之一）③ 注入步骤可复现且已复原 ④ 与现有 57 条 FAQ 回归无冲突 |
+| 评审标准 | ① 测试在 CI 实际执行（附 CI 链接，防"配而未接"）② 断言含降级语义（degraded 标记 / schema 同构 / 不打主模型之一）③ 注入步骤可复现且已复原 ④ 与现有 67 条单测基线无冲突 |
 | 双导师签栏 | 企业导师（签名/日期）：__________　校内导师（签名/日期）：__________ |
 
 ## 八、评价设计（任务单评分表，满分 100）
@@ -280,7 +316,7 @@ def test_both_down_template_ok(chaos_all):
 ## 九、课后费曼任务
 
 - **讲给谁**：室友或家人（完全不懂分布式系统）。
-- **讲什么**：DPC 降级铁律——"没被契约测试证明的降级路径等于不存在"。用消防通道类比：大楼（系统）修了备用出口（降级路径），但从没演练过（契约测试），火灾那天（主模型挂了）你敢赌它是通的吗？
+- **讲什么**：DPC 降级铁律——"没被契约测试证明的降级路径等于不存在"。课堂已用消防通道类比讲过（大楼修了备用出口，但从没演练过，火灾那天你敢赌它是通的吗）——课后**不许再用消防通道**，自创一个全新的生活化类比讲同一条铁律，并说明你的类比在哪个细节上比消防通道更贴切。
 - **自评三问**：①我能说清"降级路径存在"和"降级路径被证明可用"的区别吗？②对方能复述"为什么要演练"吗？③我举的三个降级例子（主→备 / 双挂→模板 / OPEN 直走备）各对应什么故障吗？——任一问答"否"，重讲并录音自查。
 
 ## 十、教学反思栏（授课后 48 小时内填写）

@@ -37,6 +37,7 @@ C_TEXT = RGBColor(0x2C, 0x33, 0x45)
 C_MUTED = RGBColor(0x6B, 0x7A, 0x90)
 C_BG_LIGHT = RGBColor(0xF2, 0xF5, 0xFA)
 C_WHITE = RGBColor(0xFF, 0xFF, 0xFF)
+C_ACCENT_DK = RGBColor(0x1D, 0x6F, 0xBF)  # 深一档青蓝：白字对比度达标
 C_TABLE_HEAD = RGBColor(0x24, 0x3B, 0x63)
 C_CODE_BG = RGBColor(0x0F, 0x1B, 0x2D)
 C_CODE_TX = RGBColor(0xC9, 0xE0, 0xFF)
@@ -72,13 +73,17 @@ def parse_blocks(md_text):
             i += 1
             continue
         if s.startswith("```"):
+            lang = s[3:].strip().lower()
             buf = []
             i += 1
             while i < n and not lines[i].strip().startswith("```"):
                 buf.append(lines[i])
                 i += 1
             i += 1
-            blocks.append(("code", "\n".join(buf)))
+            if lang == "flow":
+                blocks.append(("flow", "\n".join(buf)))
+            else:
+                blocks.append(("code", "\n".join(buf)))
             continue
         m = re.match(r"^(#{1,4})\s+(.*)$", s)
         if m:
@@ -106,7 +111,7 @@ def parse_blocks(md_text):
             continue
         m = re.match(r"^[-*]\s+(.*)$", s)
         if m:
-            items, while_i = [], i
+            items = []
             while i < n:
                 s2 = lines[i].strip()
                 m2 = re.match(r"^[-*]\s+(.*)$", s2)
@@ -122,7 +127,7 @@ def parse_blocks(md_text):
             continue
         m = re.match(r"^(\d+)[.、)]\s*(.*)$", s)
         if m:
-            items, while_i = [], i
+            items = []
             while i < n:
                 s2 = lines[i].strip()
                 m2 = re.match(r"^(\d+)[.、)]\s*(.*)$", s2)
@@ -267,7 +272,7 @@ def page_footer(slide, page_no=None, total=None):
     p = tf.paragraphs[0]
     r = p.add_run()
     r.text = f"《{COURSE_NAME}》｜德国双元制本土化 · 费曼学习法 · 布鲁姆认知分层"
-    set_run_font(r, 9, color=C_MUTED)
+    set_run_font(r, 10, color=C_MUTED)
     if page_no is not None:
         tb2, tf2 = add_textbox(slide, SLIDE_W - Inches(1.3), Inches(7.08), Inches(0.75), Inches(0.3))
         p2 = tf2.paragraphs[0]
@@ -282,6 +287,27 @@ def new_content_page(prs, title, subtitle=None, step_idx=None, page_no=None, tot
     page_header(slide, title, subtitle, step_idx, page_no, total)
     return slide
 
+
+def render_section_pages(prs, page_counter, title, subtitle, blocks, size=15, step_idx=None, max_parts=6):
+    """整节渲染：内容超页自动开续页（续页标题加"（续N）"），绝不静默丢内容。"""
+    rest = blocks
+    part = 0
+    while rest is not None:
+        cursor = {"rest": None}
+        page_counter["n"] += 1
+        slide = new_content_page(
+            prs,
+            title + (f"（续{part}）" if part else ""),
+            subtitle,
+            step_idx=step_idx,
+            page_no=page_counter["n"],
+        )
+        _, overflow = render_blocks(slide, rest, CONTENT_TOP + Inches(0.15), size=size, cursor_state=cursor)
+        rest = cursor["rest"] if overflow else None
+        part += 1
+        if part >= max_parts:
+            break
+
 # ============================================================================
 # 四、内容块渲染（带高度估算与自动分页）
 # ============================================================================
@@ -289,7 +315,7 @@ def new_content_page(prs, title, subtitle=None, step_idx=None, page_no=None, tot
 def est_block_height(block, width_in, size):
     kind, payload = block
     if kind in ("h3",):
-        return size * 1.9 + 6
+        return size * 2.4 + 8
     if kind in ("p", "quote"):
         chars_per_line = max(int(width_in * 72 / (size * 1.05)), 8)
         text = strip_md(payload)
@@ -308,18 +334,22 @@ def est_block_height(block, width_in, size):
         cols = max(len(r) for r in rows) if rows else 1
         col_w = width_in / cols
         total = 0
-        body_size = max(size - 3, 9)
+        body_size = max(size - 2, 12)
         for ri, row in enumerate(rows):
             max_lines = 1
             cpl = max(int(col_w * 72 / (body_size * 1.02)), 4)
             for cell in row:
                 lines = max(1, -(-len(strip_md(cell)) // cpl))
                 max_lines = max(max_lines, lines)
-            total += max_lines * body_size * 1.5 + 6
+            total += max_lines * body_size * 1.7 + 6
         return total + 4
     if kind == "code":
         lines = payload.count("\n") + 1
-        return min(lines * (size - 2) * 1.35 + 12, CONTENT_H / 914400 * 72 * 0.6)
+        return min(lines * (size - 2) * 1.45 + 12, CONTENT_H / 914400 * 72 * 0.6)
+    if kind == "flow":
+        steps = [t for t in re.split(r"→|->|-->|\n", strip_md(payload)) if t.strip()]
+        n_rows = -(-len(steps) // 4)
+        return (0.85 if n_rows == 1 else 0.72 * n_rows + 0.18 * (n_rows - 1) + 0.2) * 72 + 8
     return size * 1.6
 
 
@@ -328,7 +358,8 @@ def render_blocks(slide, blocks, y_start, size=15, step_idx=None, cursor_state=N
     y = y_start
     for bi, block in enumerate(blocks):
         kind, payload = block
-        h = est_block_height(block, CONTENT_W / 914400, size)
+        # est_block_height 返回磅(pt)，统一换算成 EMU 再与 CONTENT_BOTTOM 比较
+        h = Emu(int(est_block_height(block, CONTENT_W / 914400, size) * 12700))
         if y + h > CONTENT_BOTTOM and (kind != "p" or strip_md(payload)):
             if cursor_state is not None:
                 cursor_state["rest"] = blocks[bi:]
@@ -339,6 +370,92 @@ def render_blocks(slide, blocks, y_start, size=15, step_idx=None, cursor_state=N
     return y, False
 
 
+def render_flow(slide, code, y, size):
+    """把 ```flow 块渲染成箭头流程图（人字形箭头，自动换行）。"""
+    from pptx.enum.shapes import MSO_SHAPE
+    text = strip_md(code)
+    steps = [t.strip() for t in re.split(r"→|->|-->|\n", text) if t.strip()]
+    if not steps:
+        return y
+    max_per_row = 4
+    rows = [steps[i:i + max_per_row] for i in range(0, len(steps), max_per_row)]
+    n_rows = len(rows)
+    gap = Inches(0.12)
+    usable_w = CONTENT_W
+    shape_w = int((usable_w - gap * (max_per_row - 1)) / max_per_row)
+    # 高度按行数分：单行大，双行中
+    total_h = Inches(0.85) if n_rows == 1 else Inches(0.72) * n_rows + Inches(0.18) * (n_rows - 1)
+    if y + total_h > CONTENT_BOTTOM:
+        return y  # 放不下则跳过（调用方分页后重排）
+    cy = y
+    palette = [C_ACCENT, C_PRIMARY, C_HIGHLIGHT, RGBColor(0x2E, 0x8B, 0x6E)]
+    for ri, row in enumerate(rows):
+        cnt = len(row)
+        rw = int((usable_w - gap * (cnt - 1)) / cnt)
+        x = CONTENT_X
+        for ci, step in enumerate(row):
+            fill = palette[(ri + ci) % len(palette)]
+            sh = slide.shapes.add_shape(MSO_SHAPE.PENTAGON if ci < cnt - 1 else MSO_SHAPE.RECTANGLE, x, cy, rw, Inches(0.72))
+            sh.fill.solid()
+            sh.fill.fore_color.rgb = fill
+            sh.line.fill.background()
+            sh.shadow.inherit = False
+            tf = sh.text_frame
+            tf.word_wrap = True
+            tf.margin_left = Emu(int(0.06 * 914400))
+            tf.margin_right = Emu(int(0.06 * 914400))
+            p = tf.paragraphs[0]
+            p.alignment = PP_ALIGN.CENTER
+            r = p.add_run()
+            r.text = step[:24]
+            set_run_font(r, max(size - 1, 13), bold=True, color=C_WHITE)
+            x += rw + gap
+        cy += Inches(0.72) + Inches(0.18)
+    return y + total_h + Emu(70000)
+
+
+def render_term_cards(slide, rows, y, size=14):
+    """术语小白卡：表(术语|人话解释|生活化类比) → 两列卡片网格。返回结束 y 或 None(放不下首卡)。"""
+    data = [r for r in rows[1:] if len(r) >= 2] if rows else []
+    if not data:
+        return y
+    card_w = int((CONTENT_W - Inches(0.3)) / 2)
+    row_h = Inches(1.12)
+    gap = Inches(0.3)
+    vgap = Inches(0.18)
+    cy = y
+    ci = 0
+    for term, expl in [(r[0], r[1] if len(r) == 2 else r[1] + ("｜类比：" + r[2] if len(r) > 2 and r[2] else "")) for r in data]:
+        col = ci % 2
+        if col == 0:
+            cy_next = cy + row_h + vgap
+            if cy_next > CONTENT_BOTTOM:
+                return None
+        x = CONTENT_X + col * (card_w + gap)
+        # 卡片底
+        add_rect(slide, x, cy, card_w, row_h, C_BG_LIGHT, line=C_ACCENT)
+        # 术语头条
+        add_rect(slide, x, cy, card_w, Inches(0.34), C_ACCENT)
+        tb, tf = add_textbox(slide, x + Inches(0.08), cy + Inches(0.03), card_w - Inches(0.16), Inches(0.3))
+        p = tf.paragraphs[0]
+        r = p.add_run()
+        r.text = strip_md(term)[:18]
+        set_run_font(r, 13, bold=True, color=C_WHITE)
+        # 解释
+        tb, tf = add_textbox(slide, x + Inches(0.08), cy + Inches(0.4), card_w - Inches(0.16), row_h - Inches(0.46))
+        tf.word_wrap = True
+        p = tf.paragraphs[0]
+        r = p.add_run()
+        r.text = strip_md(expl)[:110]
+        set_run_font(r, 11, color=C_TEXT)
+        if col == 1:
+            cy += row_h + vgap
+        ci += 1
+    if ci % 2 == 1:
+        cy += row_h + vgap
+    return cy
+
+
 def render_block(slide, block, y, size):
     kind, payload = block
     if kind == "h3":
@@ -346,8 +463,8 @@ def render_block(slide, block, y, size):
         p = tf.paragraphs[0]
         r = p.add_run()
         r.text = "▍" + strip_md(payload)
-        set_run_font(r, size + 1, bold=True, color=C_ACCENT)
-        return y + Emu(int((size * 1.9 + 6) * 12700))
+        set_run_font(r, size + 3, bold=True, color=C_ACCENT)
+        return y + Emu(int((size * 2.4 + 8) * 12700))
     if kind == "p":
         return render_para(slide, payload, y, size, color=C_TEXT)
     if kind == "quote":
@@ -358,12 +475,15 @@ def render_block(slide, block, y, size):
         return render_table(slide, payload, y, size)
     if kind == "code":
         return render_code(slide, payload, y, size)
+    if kind == "flow":
+        return render_flow(slide, payload, y, size)
     return y
 
 
 def render_para(slide, text, y, size, color=C_TEXT, italic=False):
     h_pt = est_block_height(("p", text), CONTENT_W / 914400, size)
-    tb, tf = add_textbox(slide, CONTENT_X, y, CONTENT_W, Emu(int(h_pt * 12700) + 20000))
+    box_h = min(int(h_pt * 12700) + 20000, max(int(SLIDE_H) - int(y) - 20000, 100000))
+    tb, tf = add_textbox(slide, CONTENT_X, y, CONTENT_W, Emu(box_h))
     p = tf.paragraphs[0]
     for seg, bold in inline_runs(text):
         r = p.add_run()
@@ -372,16 +492,33 @@ def render_para(slide, text, y, size, color=C_TEXT, italic=False):
     return y + Emu(int(h_pt * 12700))
 
 
+BLOOM_COLORS = {
+    "记忆": RGBColor(0x8E, 0x9B, 0xAA),
+    "理解": RGBColor(0x2E, 0x86, 0xDE),
+    "应用": RGBColor(0x2E, 0x8B, 0x6E),
+    "分析": RGBColor(0x7B, 0x4F, 0xB5),
+    "评价": RGBColor(0xF3, 0x9C, 0x12),
+    "创造": RGBColor(0xD3, 0x5A, 0x3C),
+}
+
+
+def bloom_tag(item):
+    m = re.search(r"【(记忆|理解|应用|分析|评价|创造)(·[^】]*)?】", item)
+    return m.group(1) if m else None
+
+
 def render_list(slide, items, y, size, ordered=False):
     marker = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮"
     for k, item in enumerate(items):
         text = strip_md(item)
         h_pt = est_block_height(("p", text), CONTENT_W / 914400, size)
-        tb, tf = add_textbox(slide, CONTENT_X, y, CONTENT_W, Emu(int(h_pt * 12700) + 20000))
+        box_h = min(int(h_pt * 12700) + 20000, max(int(SLIDE_H) - int(y) - 20000, 100000))
+        tb, tf = add_textbox(slide, CONTENT_X, y, CONTENT_W, Emu(box_h))
         p = tf.paragraphs[0]
         rm = p.add_run()
         rm.text = (f"{k+1}. " if ordered else ("• " if len(items) <= 12 else marker[k % len(marker)] + " "))
-        set_run_font(rm, size, bold=True, color=C_ACCENT)
+        tag = bloom_tag(item)
+        set_run_font(rm, size, bold=True, color=BLOOM_COLORS.get(tag, C_ACCENT))
         for seg, bold in inline_runs(item):
             r = p.add_run()
             r.text = seg
@@ -390,10 +527,21 @@ def render_list(slide, items, y, size, ordered=False):
     return y
 
 
+def _wrap_code_line(ln, width=96):
+    import textwrap
+    if len(ln) <= width:
+        return [ln]
+    wrapped = textwrap.wrap(ln, width=width, subsequent_indent="  ↪ ", break_long_words=True, break_on_hyphens=False)
+    return wrapped or [ln]
+
+
 def render_code(slide, code, y, size):
-    lines = code.splitlines() or [""]
-    line_h = max(size - 2, 9) * 1.35
-    max_lines = 14
+    raw = code.splitlines() or [""]
+    lines = []
+    for ln in raw:
+        lines.extend(_wrap_code_line(ln))
+    line_h = max(size - 2, 12) * 1.45
+    max_lines = 12
     shown = lines[:max_lines]
     h = int(len(shown) * line_h + 14)
     sh = add_rect(slide, CONTENT_X, y, CONTENT_W, Emu(int(h * 12700)), C_CODE_BG)
@@ -407,15 +555,16 @@ def render_code(slide, code, y, size):
         p.alignment = PP_ALIGN.LEFT
         r = p.add_run()
         r.text = ln[:110]
-        set_run_font(r, max(size - 2, 9), color=C_CODE_TX)
+        set_run_font(r, max(size - 2, 12), color=C_CODE_TX)
     y = y + Emu(int(h * 12700)) + Emu(60000)
     if len(lines) > max_lines:
-        tb, tf2 = add_textbox(slide, CONTENT_X, y, CONTENT_W, Inches(0.25))
+        hint_h = Emu(min(int(0.25 * 914400), max(int(SLIDE_H) - int(y) - 10000, 100000)))
+        tb, tf2 = add_textbox(slide, CONTENT_X, y, CONTENT_W, hint_h)
         p = tf2.paragraphs[0]
         r = p.add_run()
-        r.text = f"…（另有 {len(lines)-max_lines} 行，详见教学方案原文）"
+        r.text = f"…（另有 {len(lines)-max_lines} 行，完整命令与输出见本讲实验指导书）"
         set_run_font(r, 10, color=C_MUTED)
-        y += Emu(int(0.28 * 914400 * 914400 // 914400)) if False else Emu(int(0.28 * 914400))
+        y += Emu(int(0.28 * 914400))
     return y
 
 
@@ -423,9 +572,9 @@ def render_table(slide, rows, y, size):
     if not rows:
         return y
     ncols = max(len(r) for r in rows)
-    body_size = max(size - 3, 9)
+    body_size = max(size - 2, 12)
     total_h = est_block_height(("table", rows), CONTENT_W / 914400, size)
-    max_rows = 16
+    max_rows = 10
     shown = rows[:max_rows]
     gf = slide.shapes.add_table(len(shown), ncols, CONTENT_X, y, CONTENT_W, Emu(int(min(total_h, CONTENT_H / 914400 * 72) * 12700)))
     table = gf.table
@@ -457,10 +606,11 @@ def render_table(slide, rows, y, size):
                 set_run_font(r, body_size, color=C_TEXT)
     y = y + gf.height + Emu(50000)
     if len(rows) > max_rows:
-        tb, tf = add_textbox(slide, CONTENT_X, y, CONTENT_W, Inches(0.25))
+        hint_h = Emu(min(int(0.25 * 914400), max(int(SLIDE_H) - int(y) - 10000, 100000)))
+        tb, tf = add_textbox(slide, CONTENT_X, y, CONTENT_W, hint_h)
         p = tf.paragraphs[0]
         r = p.add_run()
-        r.text = f"…（另有 {len(rows)-max_rows} 行，详见教学方案原文）"
+        r.text = f"…（另有 {len(rows)-max_rows} 行，完整表格见本讲教学方案）"
         set_run_font(r, 10, color=C_MUTED)
         y += Emu(int(0.28 * 914400))
     return y
@@ -582,7 +732,7 @@ def build_lesson_ppt(md_path, total_pages_hint=None):
     ]
     card_h = Inches(0.72)
     for no, t, sub in agenda:
-        add_rect(slide, CONTENT_X, y, Inches(0.62), card_h - Inches(0.1), C_ACCENT)
+        add_rect(slide, CONTENT_X, y, Inches(0.62), card_h - Inches(0.1), C_ACCENT_DK)
         tb, tf = add_textbox(slide, CONTENT_X, y + Inches(0.08), Inches(0.62), Inches(0.4))
         p = tf.paragraphs[0]
         p.alignment = PP_ALIGN.CENTER
@@ -603,23 +753,44 @@ def build_lesson_ppt(md_path, total_pages_hint=None):
     # ---------- 学习情境基本信息 ----------
     st, sb = get_section(sections, "学习情境基本信息")
     if sb:
-        page_counter["n"] += 1
-        slide = new_content_page(prs, "学习情境基本信息", "双元场所 · 学时 · 布鲁姆层级", page_no=page_counter["n"])
-        render_blocks(slide, sb, CONTENT_TOP + Inches(0.1), size=15)
+        render_section_pages(prs, page_counter, "学习情境基本信息", "双元场所 · 学时 · 布鲁姆层级", sb, size=15)
+
+    # ---------- 术语小白卡（大一/大二友好，卡片网格 + 自动分页） ----------
+    st, sb = get_section(sections, "术语小白卡")
+    if sb:
+        tables = [b[1] for b in sb if b[0] == "table" and len(b[1]) > 1]
+        rows = tables[0] if tables else []
+        if rows:
+            part = 0
+            while rows:
+                page_counter["n"] += 1
+                slide = new_content_page(
+                    prs,
+                    "术语小白卡（先看懂再开工）" + (f"（续{part}）" if part else ""),
+                    "人话解释 · 生活化类比 · 本讲会用到",
+                    page_no=page_counter["n"],
+                )
+                end_y = render_term_cards(slide, rows, CONTENT_TOP + Inches(0.12))
+                if end_y is None:
+                    break
+                used = end_y - (CONTENT_TOP + Inches(0.12))
+                avail = CONTENT_H
+                # 估算已渲染卡片数：按卡片行高近似回推
+                card_rows_fit = max(1, int(used // int((1.12 + 0.18) * 914400)))
+                rows = rows[1 + card_rows_fit * 2:]
+                part += 1
+                if part > 4:
+                    break
 
     # ---------- 任务描述 ----------
     st, sb = get_section(sections, "任务描述")
     if sb:
-        page_counter["n"] += 1
-        slide = new_content_page(prs, "客户委托单（任务描述）", "本讲要解决的真实业务问题", page_no=page_counter["n"])
-        render_blocks(slide, sb, CONTENT_TOP + Inches(0.1), size=16)
+        render_section_pages(prs, page_counter, "客户委托单（任务描述）", "本讲要解决的真实业务问题", sb, size=16)
 
     # ---------- 学习目标 ----------
     st, sb = get_section(sections, "学习目标")
     if sb:
-        page_counter["n"] += 1
-        slide = new_content_page(prs, "学习目标（布鲁姆分层）", "可测量的行为化目标 · 考核即按此命题", page_no=page_counter["n"])
-        render_blocks(slide, sb, CONTENT_TOP + Inches(0.1), size=15)
+        render_section_pages(prs, page_counter, "学习目标（布鲁姆分层）", "可测量的行为化目标 · 考核即按此命题", sb, size=15)
 
     # ---------- 重点 ----------
     st, sb = get_section(sections, "教学重点与难点")
@@ -627,21 +798,19 @@ def build_lesson_ppt(md_path, total_pages_hint=None):
         subs = split_sections(sb, level=3)
         for sub_title, sub_blocks in subs:
             is_key = "重点" in sub_title
-            page_counter["n"] += 1
-            slide = new_content_page(
+            render_section_pages(
                 prs,
-                "教学重点" if is_key else "教学难点与突破策略",
+                page_counter,
+                ("教学重点" if is_key else "教学难点与突破策略") + " · " + sub_title[:18],
                 sub_title,
-                page_no=page_counter["n"],
+                sub_blocks,
+                size=15,
             )
-            render_blocks(slide, sub_blocks, CONTENT_TOP + Inches(0.1), size=15)
 
     # ---------- 教学准备 ----------
     st, sb = get_section(sections, "教学准备")
     if sb:
-        page_counter["n"] += 1
-        slide = new_content_page(prs, "教学准备", "环境 · 资料 · 分组 · 安全须知", page_no=page_counter["n"])
-        render_blocks(slide, sb, CONTENT_TOP + Inches(0.1), size=13)
+        render_section_pages(prs, page_counter, "教学准备", "环境 · 资料 · 分组 · 安全须知", sb, size=14)
 
     # ---------- 六步法过程 ----------
     st, sb = get_section(sections, "教学过程设计")
@@ -649,9 +818,7 @@ def build_lesson_ppt(md_path, total_pages_hint=None):
         steps = split_sections(sb, level=3)
         for sub_title, sub_blocks in steps:
             if re.match(r"^6\.0", sub_title):
-                page_counter["n"] += 1
-                slide = new_content_page(prs, "六步工作法 · 过程总表", "校内 4 学时节奏", page_no=page_counter["n"])
-                render_blocks(slide, sub_blocks, CONTENT_TOP + Inches(0.1), size=13)
+                render_section_pages(prs, page_counter, "六步工作法 · 过程总表", "校内 4 学时节奏", sub_blocks, size=14)
                 continue
             idx = step_of(sub_title)
             if idx is None:
@@ -698,16 +865,12 @@ def build_lesson_ppt(md_path, total_pages_hint=None):
     # ---------- 评价设计 ----------
     st, sb = get_section(sections, "评价设计")
     if sb:
-        page_counter["n"] += 1
-        slide = new_content_page(prs, "本讲评价设计", "任务单评分 · 证据链要求", page_no=page_counter["n"])
-        render_blocks(slide, sb, CONTENT_TOP + Inches(0.1), size=13)
+        render_section_pages(prs, page_counter, "本讲评价设计", "任务单评分 · 证据链要求", sb, size=14)
 
     # ---------- 课后费曼 ----------
     st, sb = get_section(sections, "课后费曼任务")
     if sb:
-        page_counter["n"] += 1
-        slide = new_content_page(prs, "课后费曼任务", "以教代学 · 讲给非技术听众", page_no=page_counter["n"])
-        render_blocks(slide, sb, CONTENT_TOP + Inches(0.1), size=16)
+        render_section_pages(prs, page_counter, "课后费曼任务", "以教代学 · 讲给非技术听众", sb, size=16)
 
     # ---------- 结束页 ----------
     page_counter["n"] += 1
@@ -741,6 +904,25 @@ def build_lesson_ppt(md_path, total_pages_hint=None):
     return prs, page_counter["n"]
 
 
+def _warn_budget(md_path):
+    """PPT 视图预算告警：h3 节正文 >180 字 / 表格 >8 行 / 代码 >12 行 时提醒瘦身。"""
+    blocks = parse_blocks(md_path.read_text(encoding="utf-8"))
+    cur, cnt = "", 0
+    for kind, payload in blocks:
+        if kind == "h3":
+            if cnt > 180:
+                print(f"  [WARN] {md_path.stem} · h3「{cur[:20]}」正文 {cnt} 字 > 180 字预算，PPT 将占多页")
+            cur, cnt = payload, 0
+        elif kind == "p":
+            cnt += len(strip_md(payload))
+        elif kind == "ul" or kind == "ol":
+            cnt += sum(len(strip_md(x)) for x in payload)
+        elif kind == "table" and len(payload) > 9:
+            print(f"  [WARN] {md_path.stem} · h3「{cur[:20]}」表格 {len(payload)} 行 > 8 行，注意分片")
+        elif kind == "code" and payload.count("\n") + 1 > 12:
+            print(f"  [WARN] {md_path.stem} · h3「{cur[:20]}」代码 {payload.count(chr(10)) + 1} 行 > 12 行")
+
+
 def main():
     args = [a.upper() for a in sys.argv[1:] if not a.startswith("-")]
     lesson_files = sorted(SRC_DIR.glob("L*.md"))
@@ -756,6 +938,7 @@ def main():
         no = m.group(1)
         if args and no not in args:
             continue
+        _warn_budget(f)
         prs, pages = build_lesson_ppt(f)
         out = OUT_DIR / f"{f.stem}.pptx"
         prs.save(out)

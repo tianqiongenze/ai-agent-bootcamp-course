@@ -8,7 +8,7 @@
 
 | 驱动因素 | 约束/目标 |
 |---|---|
-| 容量目标 | 100 万并发用户（**设计目标**；本集群 2 节点实测上限+线性外推验收，见测试报告 §容量） |
+| 容量目标 | 100 万注册用户（≈10 万并发连接，**设计目标**；本集群 2 节点实测上限+线性外推验收，见测试报告 §容量） |
 | 场景 | P0 NL2SQL 自助查询 · P1 数据质量主动治理 · P2 ETL 编排开发（优先级 P0>P1>P2） |
 | 硬件 | 10.167.2.175（master, 16C/126G）+ 10.167.2.176（worker, 64C/125G/3T），无 GPU |
 | 存量约束 | master CPU requests 99% / worker1 内存 requests 97%；v1（dataagent-prod/course）并行不动 |
@@ -20,7 +20,7 @@
 L0 接入层   React18+TS+AntD 控制台（洞察/质量/ETL/审批/管理 五工作台）
             ingress-nginx(dataagent.platform.local) + NodePort 30281
 L1 网关层   dap-gateway ×3：FastAPI + Strawberry GraphQL + REST + SSE
-            多租户 JWT RBAC · per-tenant 令牌桶限流 · GraphQL 深度防护
+            多租户 JWT RBAC · per-tenant 限流（Redis INCR 窗口，R2 版；Redis 故障降级进程内令牌桶）· GraphQL 深度防护
 L2 编排层   dap-worker ×3：状态图编排（LangGraph 同构，ADR-002）
             Pulsar 共享订阅消费 · 同步缓存路径/异步任务路径
 L3 Agent层  insight(NL2SQL) · quality+rca(质量双Agent) · etl(编排) —— 边界明确互不越权
@@ -54,8 +54,8 @@ L6 数据平台 TiDB v8.5.8（目标数仓，零售样例 ODS→ADS）· CRDB(�
 
 | Deployment | 副本 | 资源(request) | 探针 |
 |---|---|---|---|
-| dap-gateway | 3 (HPA 3-10) | 150m/256Mi | readyz(全依赖)+preStop 5s |
-| dap-worker | 3 (HPA 3-12) | 150m/384Mi | readyz |
+| dap-gateway | 3 (HPA 3-4) | 150m/256Mi | readyz(全依赖)+preStop 5s |
+| dap-worker | 3 (HPA 3-5) | 150m/384Mi | readyz |
 | dap-tools | 2 | 100m/256Mi | readyz |
 | dap-redis | 1 | 50m/128Mi | redis-cli ping |
 
