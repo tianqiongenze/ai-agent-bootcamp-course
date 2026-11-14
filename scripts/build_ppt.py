@@ -899,7 +899,6 @@ def build_lesson_ppt(md_path, total_pages_hint=None):
     r = p.add_run()
     r.text = f"《{COURSE_NAME}》课程仓库 · 教学方案为本课件单一事实源"
     set_run_font(r, 11, color=RGBColor(0x8A, 0x9D, 0xBE))
-    page_counter["n"] += 1
 
     return prs, page_counter["n"]
 
